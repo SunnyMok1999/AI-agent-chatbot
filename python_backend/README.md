@@ -109,3 +109,38 @@ Config knobs:
 - `ENABLE_MULTI_AGENT_TUTOR=true`
 
 You can point your frontend `VITE_API_URL` to this backend once ready.
+
+## HKDSE 2012 PDF Inference Diagnostics (Root Cause + Fixes)
+
+### Root causes identified
+- Upload context was global-only and short-lived, so follow-up questions could lose document grounding.
+- Upload text was truncated (`text[:20000]`), dropping later question regions and diagram references.
+- Question navigation for Q1–Q3 relied on loose regex over unstructured text, causing boundary misses.
+- There was no deterministic document attribution (fingerprint/page checksum), so provenance could not be verified.
+
+### Implemented fixes
+- Session-scoped persistent upload context keyed by `session_id`/`conversation_id` with on-disk state.
+- Dual-path PDF processing: direct extraction from uploaded document + vector retrieval ingestion.
+- HKDSE question segmentation for Questions 1–3 with stored question/page mapping and `GET /api/upload/questions`.
+- Verification metadata: SHA-256 PDF fingerprint, per-page checksums, response attribution in debug/answers.
+- OCR/scan issue detection flags for low text density, symbol corruption, and unstable complex notation.
+
+### Reproducible diagnostics
+1. Upload HKDSE Core Math 2012 PDF via `/api/upload` with `session_id=<chat_id>`.
+2. Call `/api/upload/questions?session_id=<chat_id>` and verify Q1–Q3 extraction.
+3. Ask `/api/debug/chat` with `conversation_id=<chat_id>` and inspect:
+   - `upload_context.fingerprint`
+   - `upload_context.page_checksums`
+   - `retrieval_debug.attribution`
+4. Validate persistence by restarting chat turns without re-upload in the same session id.
+
+### Test suite added
+- Unit: math OCR symbol normalization.
+- Integration: question boundary detection for Q1–Q3.
+- End-to-end style: marking-scheme alignment score check for HKDSE-style solution steps.
+
+Run:
+```bash
+cd python_backend
+python -m unittest discover -s tests -v
+```

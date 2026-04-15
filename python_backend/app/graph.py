@@ -23,6 +23,11 @@ class GraphState(TypedDict, total=False):
     context: str
     uploaded_text: str
     uploaded_source: str
+    uploaded_question_blocks: Dict[str, str]
+    uploaded_question_pages: Dict[str, List[int]]
+    upload_fingerprint: str
+    upload_page_checksums: Dict[int, str]
+    upload_scan_issues: List[str]
     answer: str
     sources: List[str]
     image_data_url: str
@@ -294,6 +299,31 @@ def _extract_requested_question_blocks(uploaded_text: str, question: str) -> str
 
     header = f"Requested questions {start_n}-{end_n}" if start_n != end_n else f"Requested question {start_n}"
     return f"{header}\n\n{preamble}\n\n" + "\n\n".join(selected)
+
+
+def _extract_requested_question_blocks_from_map(
+    question_blocks: Dict[str, str],
+    question_pages: Dict[str, List[int]],
+    question: str,
+) -> str:
+    if not question_blocks:
+        return ""
+    question_range = _normalize_requested_question_range(question)
+    if not question_range:
+        # Default: keep concise context from Q1-Q3 if available.
+        picked = [question_blocks[k] for k in sorted(question_blocks.keys()) if k in {"1", "2", "3"}]
+        return "\n\n".join(picked[:2])
+    start_n, end_n = question_range
+    chunks: List[str] = []
+    for n in range(start_n, end_n + 1):
+        key = str(n)
+        body = (question_blocks.get(key) or "").strip()
+        if not body:
+            continue
+        pages = question_pages.get(key, [])
+        page_label = f" (pages: {', '.join(str(p) for p in pages)})" if pages else ""
+        chunks.append(f"Question {n}{page_label}\n{body}")
+    return "\n\n".join(chunks)
 
 
 def _tokenize(text: str) -> List[str]:
@@ -715,9 +745,30 @@ def node_generate(state: GraphState) -> GraphState:
 
     uploaded_text = (state.get("uploaded_text") or "").strip()
     uploaded_source = (state.get("uploaded_source") or "").strip()
+    uploaded_question_blocks = state.get("uploaded_question_blocks") or {}
+    uploaded_question_pages = state.get("uploaded_question_pages") or {}
+    upload_fingerprint = (state.get("upload_fingerprint") or "").strip()
+    upload_page_checksums = state.get("upload_page_checksums") or {}
+    upload_scan_issues = state.get("upload_scan_issues") or []
     if uploaded_text:
         upload_header = f"[Latest uploaded document{f': {uploaded_source}' if uploaded_source else ''}]"
-        upload_context = f"{upload_header}\n{_extract_requested_question_blocks(uploaded_text, state.get('question', guided_question))}"
+        requested_only = _extract_requested_question_blocks_from_map(
+            uploaded_question_blocks,
+            uploaded_question_pages,
+            state.get("question", guided_question),
+        )
+        if not requested_only:
+            requested_only = _extract_requested_question_blocks(uploaded_text, state.get("question", guided_question))
+        upload_context = f"{upload_header}\n{requested_only}"
+        if upload_fingerprint:
+            upload_context = f"{upload_context}\n\n[Document fingerprint] {upload_fingerprint}"
+        if upload_page_checksums:
+            preview_checksums = ", ".join(
+                f"p{p}:{str(v)[:10]}" for p, v in list(sorted(upload_page_checksums.items()))[:5]
+            )
+            upload_context = f"{upload_context}\n[Page checksums] {preview_checksums}"
+        if upload_scan_issues:
+            upload_context = f"{upload_context}\n[Scan issues] {', '.join(upload_scan_issues)}"
         if context:
             context = f"{upload_context}\n\n{context}"
         else:
@@ -834,7 +885,14 @@ def node_generate(state: GraphState) -> GraphState:
         answer = _normalize_tutor_format(answer)
         if agent_tool_traces:
             agent_outputs["_tool_traces"] = agent_tool_traces
-        return {"answer": answer, "agent_outputs": agent_outputs}
+        attribution = {
+            "mode": "direct_upload_plus_rag",
+            "source": uploaded_source,
+            "fingerprint": upload_fingerprint,
+            "question_pages": uploaded_question_pages,
+            "scan_issues": upload_scan_issues,
+        }
+        return {"answer": answer, "agent_outputs": agent_outputs, "retrieval_debug": {**(state.get("retrieval_debug") or {}), "attribution": attribution}}
 
     if context:
         prompt = (
@@ -852,7 +910,14 @@ def node_generate(state: GraphState) -> GraphState:
     result = _manager_llm().invoke(prompt)
     answer = result.content if isinstance(result.content, str) else str(result.content)
     answer = _normalize_tutor_format(answer)
-    return {"answer": answer}
+    attribution = {
+        "mode": "direct_upload_plus_rag" if uploaded_text else "rag_or_llm",
+        "source": uploaded_source,
+        "fingerprint": upload_fingerprint,
+        "question_pages": uploaded_question_pages,
+        "scan_issues": upload_scan_issues,
+    }
+    return {"answer": answer, "retrieval_debug": {**(state.get("retrieval_debug") or {}), "attribution": attribution}}
 
 
 def node_validate(state: GraphState) -> GraphState:
@@ -875,6 +940,13 @@ def node_validate(state: GraphState) -> GraphState:
 
     if len(answer) > config.MAX_RESPONSE_CHARS:
         answer = answer[: config.MAX_RESPONSE_CHARS].rsplit(" ", 1)[0].strip() + "..."
+
+    upload_source = (state.get("uploaded_source") or "").strip()
+    upload_fingerprint = (state.get("upload_fingerprint") or "").strip()
+    if upload_source:
+        answer += f"\n\nSource attribution: {upload_source}"
+        if upload_fingerprint:
+            answer += f" | fingerprint={upload_fingerprint[:16]}"
 
     return {"answer": answer, "strict_validation": strict}
 

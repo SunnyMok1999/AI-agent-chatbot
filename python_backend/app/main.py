@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Query
+from fastapi import FastAPI, UploadFile, File, Query, Form
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.documents import Document
@@ -30,6 +30,13 @@ from app.services.clarify_memory import (
     peek_pending_clarification,
     set_pending_clarification,
     clear_pending_clarification,
+)
+from app.services.pdf_math_parser import (
+    compute_page_checksums,
+    compute_pdf_fingerprint,
+    detect_scan_issues,
+    normalize_math_ocr_text,
+    segment_hkdse_questions,
 )
 
 
@@ -126,10 +133,23 @@ def _extract_pdf_text_via_vlm(pdf_bytes: bytes, max_pages: int = 3) -> str:
     return "\n\n".join(parts)
 
 
+def _resolve_session_id(raw_id: str | None) -> str:
+    sid = (raw_id or "").strip()
+    return sid if sid else "default"
+
+
+def _extract_pdf_pages_text(pdf_bytes: bytes) -> list[str]:
+    from io import BytesIO
+
+    reader = PdfReader(BytesIO(pdf_bytes))
+    return [normalize_math_ocr_text(p.extract_text() or "") for p in reader.pages]
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
-    latest_image = get_latest_image()
-    latest_text = get_latest_text()
+    session_id = _resolve_session_id(req.conversation_id)
+    latest_image = get_latest_image(session_id=session_id)
+    latest_text = get_latest_text(session_id=session_id)
     msg_lower = req.message.lower()
     use_image = latest_image and any(x in msg_lower for x in ["image", "png", "uploaded", "screenshot"])
     use_uploaded_text = bool(latest_text)
@@ -149,6 +169,11 @@ def chat(req: ChatRequest) -> ChatResponse:
         "image_data_url": latest_image.data_url if use_image else "",
         "uploaded_text": latest_text.content if use_uploaded_text else "",
         "uploaded_source": latest_text.source if use_uploaded_text else "",
+        "uploaded_question_blocks": latest_text.question_blocks if use_uploaded_text else {},
+        "uploaded_question_pages": latest_text.question_pages if use_uploaded_text else {},
+        "upload_fingerprint": latest_text.fingerprint if use_uploaded_text else "",
+        "upload_page_checksums": latest_text.page_checksums if use_uploaded_text else {},
+        "upload_scan_issues": latest_text.scan_issues if use_uploaded_text else [],
     }
     out = rag_graph.invoke(state)
 
@@ -167,8 +192,9 @@ def chat(req: ChatRequest) -> ChatResponse:
 
 @app.post("/api/debug/chat")
 def debug_chat(req: ChatRequest):
-    latest_image = get_latest_image()
-    latest_text = get_latest_text()
+    session_id = _resolve_session_id(req.conversation_id)
+    latest_image = get_latest_image(session_id=session_id)
+    latest_text = get_latest_text(session_id=session_id)
     msg_lower = req.message.lower()
     use_image = latest_image and any(x in msg_lower for x in ["image", "png", "uploaded", "screenshot"])
     use_uploaded_text = bool(latest_text)
@@ -188,6 +214,11 @@ def debug_chat(req: ChatRequest):
         "image_data_url": latest_image.data_url if use_image else "",
         "uploaded_text": latest_text.content if use_uploaded_text else "",
         "uploaded_source": latest_text.source if use_uploaded_text else "",
+        "uploaded_question_blocks": latest_text.question_blocks if use_uploaded_text else {},
+        "uploaded_question_pages": latest_text.question_pages if use_uploaded_text else {},
+        "upload_fingerprint": latest_text.fingerprint if use_uploaded_text else "",
+        "upload_page_checksums": latest_text.page_checksums if use_uploaded_text else {},
+        "upload_scan_issues": latest_text.scan_issues if use_uploaded_text else [],
     }
     out = rag_graph.invoke(state)
 
@@ -198,6 +229,12 @@ def debug_chat(req: ChatRequest):
             "content_chars": len(latest_text.content or ""),
             "preview": (latest_text.content or "")[:300],
             "uploaded_at": latest_text.uploaded_at,
+            "session_id": latest_text.session_id,
+            "fingerprint": latest_text.fingerprint,
+            "page_checksums": latest_text.page_checksums,
+            "question_blocks": sorted((latest_text.question_blocks or {}).keys()),
+            "question_pages": latest_text.question_pages,
+            "scan_issues": latest_text.scan_issues,
             "active": bool(use_uploaded_text),
         }
     elif latest_image:
@@ -229,37 +266,41 @@ def debug_chat(req: ChatRequest):
 
 
 @app.post("/api/upload")
-async def upload(file: UploadFile = File(...)):
+async def upload(file: UploadFile = File(...), session_id: str = Form(default="default")):
+    session_id = _resolve_session_id(session_id)
     name = file.filename or "uploaded_file"
     mime = file.content_type or "application/octet-stream"
     data = await file.read()
 
-    # Always clear stale upload pointers so a new upload replaces the old one.
-    clear_latest_text()
-    clear_latest_image()
+    # Replace prior upload in the same session only.
+    clear_latest_text(session_id=session_id)
+    clear_latest_image(session_id=session_id)
 
     if mime in ("image/png", "image/x-png"):
         data_url = f"data:{mime};base64,{base64.b64encode(data).decode()}"
-        set_latest_image(name, mime, data_url)
+        set_latest_image(name, mime, data_url, session_id=session_id)
         return {
             "success": True,
             "message": "PNG uploaded for direct vision-model question answering",
             "chunks_count": 0,
+            "session_id": session_id,
         }
 
     text = ""
+    page_texts: list[str] = []
+    extraction_method = "native"
     if mime in ("text/plain", "text/markdown"):
-        text = data.decode("utf-8", errors="ignore")
+        text = normalize_math_ocr_text(data.decode("utf-8", errors="ignore"))
+        page_texts = [text]
     elif mime == "application/pdf":
-        from io import BytesIO
-
-        reader = PdfReader(BytesIO(data))
-        text = "\n".join((p.extract_text() or "") for p in reader.pages)
-
+        page_texts = _extract_pdf_pages_text(data)
+        text = normalize_math_ocr_text("\n".join(page_texts))
         if len(text.strip()) < 24:
             ocr_text = _extract_pdf_text_via_vlm(data, max_pages=3)
             if ocr_text.strip():
-                text = ocr_text
+                text = normalize_math_ocr_text(ocr_text)
+                page_texts = [text]
+                extraction_method = "vlm_ocr"
     else:
         return {"success": False, "error": "Unsupported file format"}
 
@@ -309,13 +350,58 @@ async def upload(file: UploadFile = File(...)):
         )
 
     add_documents(enriched_docs)
-    set_latest_text(name, text[:20000])
+    fingerprint = compute_pdf_fingerprint(data) if mime == "application/pdf" else ""
+    page_checksums = compute_page_checksums(page_texts)
+    question_blocks = segment_hkdse_questions(text, page_texts, question_numbers=(1, 2, 3))
+    question_block_map = {str(k): v.content for k, v in question_blocks.items()}
+    question_page_map = {str(k): v.pages for k, v in question_blocks.items()}
+    scan_issues = detect_scan_issues(page_texts)
+
+    set_latest_text(
+        name,
+        text,
+        session_id=session_id,
+        fingerprint=fingerprint,
+        page_checksums=page_checksums,
+        question_blocks=question_block_map,
+        question_pages=question_page_map,
+        extraction_method=extraction_method,
+        scan_issues=scan_issues,
+    )
 
     return {
         "success": True,
         "message": "Document processed and ingested successfully",
         "chunks_count": len(enriched_docs),
         "preview": text[:220],
+        "session_id": session_id,
+        "fingerprint": fingerprint,
+        "page_checksums": page_checksums,
+        "question_blocks": sorted(question_block_map.keys()),
+        "scan_issues": scan_issues,
+    }
+
+
+@app.get("/api/upload/questions")
+def uploaded_questions(session_id: str = Query(default="default")):
+    resolved = _resolve_session_id(session_id)
+    latest_text = get_latest_text(session_id=resolved)
+    if not latest_text:
+        return {"success": False, "error": "No uploaded document found for session", "session_id": resolved}
+    return {
+        "success": True,
+        "session_id": resolved,
+        "source": latest_text.source,
+        "fingerprint": latest_text.fingerprint,
+        "questions": [
+            {
+                "question_no": int(q_no),
+                "content": content,
+                "pages": (latest_text.question_pages or {}).get(q_no, []),
+            }
+            for q_no, content in sorted((latest_text.question_blocks or {}).items(), key=lambda x: int(x[0]))
+            if q_no in {"1", "2", "3"}
+        ],
     }
 
 
