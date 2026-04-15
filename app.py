@@ -150,6 +150,7 @@ def call_nvidia_chat(
     tools: list[dict[str, Any]],
     model: str,
     enable_tools: bool = True,
+    temperature: float = 0.2,
 ) -> dict[str, Any]:
     if not NVIDIA_API_KEY:
         raise RuntimeError("Environment variable NVIDIA_API_KEY is not configured. Please set it in .env or your runtime environment.")
@@ -158,7 +159,7 @@ def call_nvidia_chat(
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "temperature": 0.2,
+        "temperature": temperature,
     }
     if enable_tools and tools:
         payload["tools"] = tools
@@ -181,6 +182,44 @@ def call_nvidia_chat(
                 f"NVIDIA API request failed ({res.status_code}). Response: {details}"
             ) from exc
         return res.json()
+
+
+def extract_math_from_images(image_data_urls: list[str]) -> str:
+    """Run a dedicated OCR/transcription pass for math notation before solving."""
+    if not image_data_urls:
+        return ""
+
+    system_prompt = (
+        "You are a strict OCR transcriber for DSE Math exam images. "
+        "Transcribe exactly. Preserve superscripts, subscripts, brackets, fraction structure, and symbols. "
+        "Do not solve. If uncertain, include [unclear] markers."
+    )
+    instructions = (
+        "Transcribe all visible math content exactly as plain text and LaTeX.\n"
+        "Output only JSON with keys: question_text, latex, options, notes.\n"
+        "Example latex format: ((2x^4)^3)/(2x^5) = ?"
+    )
+
+    content: list[dict[str, Any]] = [{"type": "text", "text": instructions}]
+    for image_url in image_data_urls:
+        content.append({"type": "image_url", "image_url": {"url": image_url}})
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": content},
+    ]
+    response = call_nvidia_chat(
+        messages=messages,
+        tools=[],
+        model=NVIDIA_VLM_MODEL,
+        enable_tools=False,
+        temperature=0.0,
+    )
+    choice = response.get("choices", [{}])[0].get("message", {})
+    raw = choice.get("content", "")
+    if isinstance(raw, str):
+        return raw
+    return json.dumps(raw, ensure_ascii=False)
 
 
 def build_tools() -> list[dict[str, Any]]:
@@ -232,10 +271,26 @@ def run_agent(agent: AgentConfig, user_text: str, session_upload_images: list[st
     user_content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
     for image_data_url in session_upload_images:
         user_content.append({"type": "image_url", "image_url": {"url": image_data_url}})
+
+    if session_upload_images:
+        extracted = extract_math_from_images(session_upload_images)
+        user_content[0]["text"] = (
+            f"{user_text}\n\n"
+            "OCR transcription from uploaded image(s) (verify with image):\n"
+            f"{extracted}\n\n"
+            "If OCR text conflicts with image, trust the image. Show the parsed expression before solving."
+        )
+
     messages.append({"role": "user", "content": user_content})
 
     if not enable_tools:
-        response = call_nvidia_chat(messages=messages, tools=tools, model=model, enable_tools=False)
+        response = call_nvidia_chat(
+            messages=messages,
+            tools=tools,
+            model=model,
+            enable_tools=False,
+            temperature=0.0,
+        )
         choice = response.get("choices", [{}])[0].get("message", {})
         content = choice.get("content", "")
         if isinstance(content, str):
