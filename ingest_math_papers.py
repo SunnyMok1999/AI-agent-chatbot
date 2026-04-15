@@ -60,11 +60,12 @@ def infer_metadata(pdf_path: Path, root: Path) -> dict[str, str]:
     rel_parts = [p.lower() for p in pdf_path.relative_to(root).parts]
     subject = "core"
     doc_type = "unknown"
+    type_mapping = {"pastpaper": "pastpaper", "answer": "answer_key", "solutions": "answer_key"}
     for token in rel_parts:
         if token in {"core", "m1", "m2"}:
             subject = token
-        if token in {"pastpaper", "answer", "solutions"}:
-            doc_type = token
+        if token in type_mapping:
+            doc_type = type_mapping[token]
     return {
         "subject": subject,
         "type": doc_type,
@@ -101,6 +102,7 @@ def run_math_ocr(ocr: Pix2Text, image_png: bytes) -> str:
     with tempfile.NamedTemporaryFile(suffix=".png") as tmp:
         tmp.write(image_png)
         tmp.flush()
+        # Pix2Text APIs differ across versions, so we support both common entry points.
         if hasattr(ocr, "recognize_markdown"):
             result = ocr.recognize_markdown(tmp.name)
         else:
@@ -164,6 +166,7 @@ def main() -> None:
         metadata={"hnsw:space": "cosine"},
     )
 
+    # "mfd" = math formula detection; this improves OCR quality for equation-heavy scanned papers.
     ocr = Pix2Text(analyzer_config={"model_name": "mfd"})
 
     pdf_files = sorted(cfg.input_dir.rglob("*.pdf"))
@@ -184,4 +187,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"Fatal error: {exc}")
+        raise SystemExit(1) from exc

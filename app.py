@@ -26,6 +26,7 @@ CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "dsemath_math")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "4"))
 MAX_PDF_PAGES_FOR_CONTEXT = int(os.getenv("MAX_PDF_PAGES_FOR_CONTEXT", "4"))
+MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "4"))
 
 
 @dataclass
@@ -109,7 +110,7 @@ def run_rag_retrieve(query: str) -> str:
 
 def call_nvidia_chat(messages: list[dict[str, Any]], tools: list[dict[str, Any]], model: str) -> dict[str, Any]:
     if not NVIDIA_API_KEY:
-        raise RuntimeError("NVIDIA_API_KEY is not configured")
+        raise RuntimeError("Environment variable NVIDIA_API_KEY is not configured. Please set it in .env or your runtime environment.")
 
     endpoint = f"{NVIDIA_BASE_URL.rstrip('/')}/chat/completions"
     payload = {
@@ -183,14 +184,19 @@ def run_agent(agent: AgentConfig, user_text: str, session_upload_images: list[st
         user_content.append({"type": "image_url", "image_url": {"url": image_data_url}})
     messages.append({"role": "user", "content": user_content})
 
-    for _ in range(4):
+    for _ in range(MAX_TOOL_ITERATIONS):
         response = call_nvidia_chat(messages=messages, tools=tools, model=model)
         choice = response.get("choices", [{}])[0].get("message", {})
         tool_calls = choice.get("tool_calls") or []
 
         if not tool_calls:
             content = choice.get("content", "")
-            return content if isinstance(content, str) else json.dumps(content)
+            if isinstance(content, str):
+                return content
+            st.warning(
+                f"Received non-string response payload from NVIDIA API (type={type(content).__name__}); returning serialized content."
+            )
+            return json.dumps(content)
 
         messages.append(
             {
@@ -218,7 +224,10 @@ def run_agent(agent: AgentConfig, user_text: str, session_upload_images: list[st
                 }
             )
 
-    return "I could not complete the tool workflow within the allowed steps. Please try again."
+    return (
+        f"I could not complete the tool workflow within {MAX_TOOL_ITERATIONS} steps. "
+        "Please retry, or check your NVIDIA API/tool configuration."
+    )
 
 
 def init_state() -> None:
@@ -240,7 +249,7 @@ def render_ui() -> None:
         options=[cfg.label for cfg in AGENT_REGISTRY.values()],
         index=0,
     )
-    selected = next(cfg for cfg in AGENT_REGISTRY.values() if cfg.label == selected_label)
+    selected = next((cfg for cfg in AGENT_REGISTRY.values() if cfg.label == selected_label), AGENT_REGISTRY["dsemath"])
     st.session_state.agent_key = selected.key
 
     uploads = st.file_uploader(
@@ -254,7 +263,8 @@ def render_ui() -> None:
         st.session_state.session_upload_names = []
         for upload in uploads or []:
             payload = upload.read()
-            suffix = upload.name.lower().rsplit(".", maxsplit=1)[-1]
+            parts = upload.name.lower().rsplit(".", maxsplit=1)
+            suffix = parts[1] if len(parts) == 2 else ""
             if suffix == "png":
                 st.session_state.session_upload_images.append(to_data_url("image/png", payload))
                 st.session_state.session_upload_names.append(upload.name)
