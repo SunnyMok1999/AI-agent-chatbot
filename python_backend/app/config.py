@@ -1,0 +1,51 @@
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+PORT = int(os.getenv("PY_BACKEND_PORT", "8002"))
+
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
+NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.1-8b-instruct")
+NVIDIA_VLM_MODEL = os.getenv("NVIDIA_VLM_MODEL", "")
+NVIDIA_MATH_MODEL = os.getenv("NVIDIA_MATH_MODEL", NVIDIA_MODEL)
+ENABLE_VLM_PREPROCESS_FOR_AGENTS = os.getenv("ENABLE_VLM_PREPROCESS_FOR_AGENTS", "true").lower() != "false"
+MAX_VLM_PREPROCESS_CHARS = int(os.getenv("MAX_VLM_PREPROCESS_CHARS", "3000"))
+EVAL_MIN_PDF_TEXT_CHARS_FOR_NATIVE_OCR = int(os.getenv("EVAL_MIN_PDF_TEXT_CHARS_FOR_NATIVE_OCR", "180"))
+EVAL_PAPER_SOLVE_TIMEOUT_SEC = int(os.getenv("EVAL_PAPER_SOLVE_TIMEOUT_SEC", "240"))
+
+# Optional per-agent models (fallback to NVIDIA_MODEL when empty)
+NVIDIA_MODEL_MANAGER = os.getenv("NVIDIA_MODEL_MANAGER", NVIDIA_MODEL)
+NVIDIA_MODEL_NEWTON = os.getenv("NVIDIA_MODEL_NEWTON", NVIDIA_MODEL)
+NVIDIA_MODEL_GAUSS = os.getenv("NVIDIA_MODEL_GAUSS", NVIDIA_MODEL)
+NVIDIA_MODEL_FEYNMAN = os.getenv("NVIDIA_MODEL_FEYNMAN", NVIDIA_MODEL)
+NVIDIA_MODEL_POLYA = os.getenv("NVIDIA_MODEL_POLYA", NVIDIA_MODEL)
+NVIDIA_MODEL_GRIFFITHS = os.getenv("NVIDIA_MODEL_GRIFFITHS", NVIDIA_MODEL)
+NVIDIA_MODEL_SAKURAI = os.getenv("NVIDIA_MODEL_SAKURAI", NVIDIA_MODEL)
+
+CHROMA_URL = os.getenv("CHROMA_URL", "http://localhost:8001")
+CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "math_documents_local_bge")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+
+TOP_K_RETRIEVAL = int(os.getenv("TOP_K_RETRIEVAL", "5"))
+ENABLE_TUTOR_MODE = os.getenv("ENABLE_TUTOR_MODE", "true").lower() != "false"
+ENABLE_HYBRID_RETRIEVAL = os.getenv("ENABLE_HYBRID_RETRIEVAL", "true").lower() != "false"
+ENABLE_MATH_RERANKER = os.getenv("ENABLE_MATH_RERANKER", "true").lower() != "false"
+RETRIEVAL_CANDIDATE_K = int(os.getenv("RETRIEVAL_CANDIDATE_K", "16"))
+
+ENABLE_DOMAIN_METADATA_FILTER = os.getenv("ENABLE_DOMAIN_METADATA_FILTER", "true").lower() != "false"
+ENABLE_CROSS_ENCODER_RERANKER = os.getenv("ENABLE_CROSS_ENCODER_RERANKER", "true").lower() != "false"
+CROSS_ENCODER_MODEL = os.getenv("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+ENABLE_MULTI_AGENT_TUTOR = os.getenv("ENABLE_MULTI_AGENT_TUTOR", "true").lower() != "false"
+MULTI_AGENT_MAX_CONTEXT_CHARS = int(os.getenv("MULTI_AGENT_MAX_CONTEXT_CHARS", "9000"))
+
+ENABLE_STRICT_CORRECTNESS_MODE = os.getenv("ENABLE_STRICT_CORRECTNESS_MODE", "true").lower() != "false"
+REFUSE_UNCERTAIN_DERIVATIONS = os.getenv("REFUSE_UNCERTAIN_DERIVATIONS", "true").lower() != "false"
+MAX_RESPONSE_CHARS = int(os.getenv("MAX_RESPONSE_CHARS", "1600"))
+SOURCE_MIN_KEYWORD_OVERLAP = float(os.getenv("SOURCE_MIN_KEYWORD_OVERLAP", "0.08"))
+SOURCE_MAX_SCORE_GAP = float(os.getenv("SOURCE_MAX_SCORE_GAP", "2.5"))
+
+ENABLE_AMBIGUITY_GATE = os.getenv("ENABLE_AMBIGUITY_GATE", "true").lower() != "false"
+AMBIGUITY_SCORE_THRESHOLD = float(os.getenv("AMBIGUITY_SCORE_THRESHOLD", "0.55"))

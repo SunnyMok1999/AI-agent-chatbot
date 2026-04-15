@@ -1,0 +1,3644 @@
+diff --git a/.env.example b/.env.example
+index 6221411..0d988e8 100644
+--- a/.env.example
++++ b/.env.example
+@@ -6,6 +6,7 @@ NODE_ENV=development
+ NVIDIA_API_KEY=your_nvidia_api_key_here
+ NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+ NVIDIA_MODEL=meta/llama-3.1-8b-instruct
++NVIDIA_VLM_MODEL=meta/llama-3.2-11b-vision-instruct
+ 
+ # OpenRouter
+ OPEN_ROUTER_API_KEY=your_open_router_api_key_here
+@@ -19,17 +20,23 @@ SUPABASE_SERVICE_KEY=your_supabase_service_key
+ 
+ # ChromaDB
+ CHROMA_PERSIST_DIRECTORY=./data/chromadb
+-CHROMA_COLLECTION_NAME=ml_documents
+-CHROMA_URL=http://localhost:8000
++CHROMA_COLLECTION_NAME=math_documents_local_bge
++CHROMA_URL=http://localhost:8001
+ 
+ # Embeddings
+-EMBEDDING_PROVIDER=openai # openai, huggingface
+-EMBEDDING_MODEL=text-embedding-3-small
++EMBEDDING_PROVIDER=local-transformers # openai, huggingface, local-transformers, local
++EMBEDDING_MODEL=Xenova/bge-base-en-v1.5
+ OPENAI_API_KEY=your_openai_api_key
+ HUGGINGFACE_API_KEY=your_huggingface_api_key_here # For HuggingFaceInferenceEmbeddings
++HUGGINGFACE_ENDPOINT_URL=https://router.huggingface.co
++EMBEDDING_BATCH_SIZE=20
++LOCAL_EMBEDDING_DIM=256
++
++# Upload API policy
++ENABLE_PUBLIC_UPLOAD=false
+ 
+ # File Upload
+-MAX_FILE_SIZE=10485760  # 10MB
++MAX_FILE_SIZE=104857600  # 100MB
+ UPLOAD_DIRECTORY=./uploads
+ 
+ # RAG Configuration
+@@ -38,7 +45,18 @@ CHUNK_OVERLAP=200
+ TOP_K_RETRIEVAL=5
+ MMR_DIVERSITY=0.5
+ MIN_CONFIDENCE_SCORE=0.7
++ENABLE_DIRECT_LLM_FALLBACK=false
++ENABLE_SMALLTALK_FALLBACK=true
++ENABLE_TUTOR_MODE=true
++ENABLE_HYBRID_RETRIEVAL=true
++ENABLE_MATH_RERANKER=true
++RETRIEVAL_CANDIDATE_K=16
++RAG_TIMEOUT_MS=45000
++RAG_RETRIEVAL_TIMEOUT_MS=12000
++RAG_LLM_TIMEOUT_MS=25000
++RAG_MAX_QUESTION_CHARS=1200
+ 
+ # Frontend
+-VITE_API_URL=http://localhost:3001
++VITE_API_URL=http://localhost:8002
+ VITE_WS_URL=ws://localhost:3001
++VITE_ENABLE_DEBUG_CHAT=true
+diff --git a/README.md b/README.md
+index 4b93247..a3d3ebd 100644
+--- a/README.md
++++ b/README.md
+@@ -97,6 +97,10 @@ To switch from ChromaDB to Qdrant later:
+ - `src/`: React frontend with components and Zustand store.
+ - `data/`: Local storage for ChromaDB and uploaded files.
+ - `scripts/`: Utility scripts for data ingestion.
++- `python_backend/`: Python rebuild using FastAPI + LangGraph + LangChain.
++
++## Python Rebuild (LangGraph + LangChain)
++If you want the modern Python pipeline, see [python_backend/README.md](python_backend/README.md).
+ 
+ ## Hallucination Guardrails
+ The RAG pipeline uses a specialized prompt that instructs the model to answer based ONLY on the provided context. If the information is missing, it will state that it doesn't have enough grounded information rather than inventing facts.
+diff --git a/api/app.ts b/api/app.ts
+index ff050e6..5e5bcf4 100644
+--- a/api/app.ts
++++ b/api/app.ts
+@@ -8,6 +8,7 @@ import express, {
+   type NextFunction,
+ } from 'express'
+ import cors from 'cors'
++import multer from 'multer'
+ import path from 'path'
+ import dotenv from 'dotenv'
+ import { fileURLToPath } from 'url'
+@@ -23,6 +24,7 @@ const __dirname = path.dirname(__filename)
+ dotenv.config()
+ 
+ const app: express.Application = express()
++const enablePublicUpload = process.env.ENABLE_PUBLIC_UPLOAD === 'true'
+ 
+ app.use(cors())
+ app.use(express.json({ limit: '10mb' }))
+@@ -33,7 +35,16 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }))
+  */
+ app.use('/api/auth', authRoutes)
+ app.use('/api/chat', chatRoutes)
+-app.use('/api/upload', uploadRoutes)
++if (enablePublicUpload) {
++  app.use('/api/upload', uploadRoutes)
++} else {
++  app.use('/api/upload', (_req: Request, res: Response) => {
++    res.status(403).json({
++      success: false,
++      error: 'Public upload is disabled. Use backend ingestion script instead.',
++    })
++  })
++}
+ 
+ /**
+  * health
+@@ -52,9 +63,25 @@ app.use(
+  * error handler middleware
+  */
+ app.use((error: Error, req: Request, res: Response, next: NextFunction) => {
++  if (error instanceof multer.MulterError) {
++    if (error.code === 'LIMIT_FILE_SIZE') {
++      const maxFileSizeBytes = parseInt(process.env.MAX_FILE_SIZE || '10485760')
++      const maxFileSizeMB = Math.round((maxFileSizeBytes / 1024 / 1024) * 10) / 10
++      return res.status(413).json({
++        success: false,
++        error: `File is too large. Maximum allowed size is ${maxFileSizeMB}MB.`,
++      })
++    }
++
++    return res.status(400).json({
++      success: false,
++      error: error.message,
++    })
++  }
++
+   res.status(500).json({
+     success: false,
+-    error: 'Server internal error',
++    error: error.message || 'Server internal error',
+   })
+ })
+ 
+diff --git a/api/controllers/chat.controller.ts b/api/controllers/chat.controller.ts
+index 6bbeca8..5d5d8a1 100644
+--- a/api/controllers/chat.controller.ts
++++ b/api/controllers/chat.controller.ts
+@@ -23,7 +23,14 @@ export const handleChat = async (req: Request, res: Response) => {
+       res.end();
+     } catch (error: any) {
+       console.error('Error in chat processing:', error);
+-      res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
++      const friendlyMessage =
++        error?.message ||
++        'The request took too long. Please try a shorter question or try again in a moment.';
++      res.write(
++        `data: ${JSON.stringify({ type: 'chunk', content: `⚠️ ${friendlyMessage}` })}\n\n`,
++      );
++      res.write(`data: ${JSON.stringify({ type: 'error', error: friendlyMessage })}\n\n`);
++      res.write(`data: ${JSON.stringify({ type: 'complete' })}\n\n`);
+       res.end();
+     }
+   } else {
+diff --git a/api/controllers/upload.controller.ts b/api/controllers/upload.controller.ts
+index 196683b..5909e44 100644
+--- a/api/controllers/upload.controller.ts
++++ b/api/controllers/upload.controller.ts
+@@ -2,14 +2,66 @@ import { Request, Response } from 'express';
+ import { RecursiveCharacterTextSplitter } from 'langchain/text_splitter';
+ import { PDFLoader } from 'langchain/document_loaders/fs/pdf';
+ import { TextLoader } from 'langchain/document_loaders/fs/text';
++import { Document } from '@langchain/core/documents';
+ import { createVectorStore } from '../services/vectorstore.service.js';
++import {
++  setLatestUploadContext,
++  setLatestUploadImageContext,
++} from '../services/upload-context.service.js';
+ import path from 'path';
+ import fs from 'fs';
+ import dotenv from 'dotenv';
++import Tesseract from 'tesseract.js';
+ 
+ dotenv.config();
+ 
+ const uploadDir = process.env.UPLOAD_DIRECTORY || './uploads';
++const ENABLE_TESSERACT_OCR = process.env.ENABLE_TESSERACT_OCR === 'true';
++const ENABLE_PNG_OCR_INGEST = process.env.ENABLE_PNG_OCR_INGEST === 'true';
++let ocrPipelinePromise: Promise<any> | null = null;
++
++async function getOcrPipeline() {
++  if (!ocrPipelinePromise) {
++    ocrPipelinePromise = (async () => {
++      const { pipeline, env } = await import('@xenova/transformers');
++      env.allowLocalModels = true;
++      env.useBrowserCache = false;
++      return await pipeline('image-to-text', process.env.OCR_MODEL || 'Xenova/trocr-base-printed');
++    })();
++  }
++
++  return ocrPipelinePromise;
++}
++
++async function extractTextFromPng(filePath: string): Promise<string> {
++  try {
++    const ocr = await getOcrPipeline();
++    const result = await ocr(filePath);
++
++    if (Array.isArray(result)) {
++      return result.map((item: any) => item?.generated_text || '').join('\n').trim();
++    }
++
++    return String(result?.generated_text || '').trim();
++  } catch (error) {
++    console.warn('Primary OCR failed for PNG, trying Tesseract fallback...', error);
++    return '';
++  }
++}
++
++async function extractTextFromPngWithTesseract(filePath: string): Promise<string> {
++  try {
++    const result = await Tesseract.recognize(filePath, 'eng');
++    return String(result?.data?.text || '').trim();
++  } catch (error) {
++    console.warn('Tesseract OCR fallback failed for PNG.', error);
++    return '';
++  }
++}
++
++function normalizeExtractedText(text: string): string {
++  return text.replace(/\r/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
++}
+ 
+ // Ensure upload directory exists
+ if (!fs.existsSync(uploadDir)) {
+@@ -24,18 +76,62 @@ export const handleUpload = async (req: Request, res: Response) => {
+   const { originalname, path: filePath, mimetype } = req.file;
+ 
+   try {
+-    let loader;
++    let docs: Document[];
++    let imageOnlyUpload = false;
++
+     if (mimetype === 'application/pdf') {
+-      loader = new PDFLoader(filePath);
++      const loader = new PDFLoader(filePath);
++      docs = await loader.load();
+     } else if (mimetype === 'text/plain' || mimetype === 'text/markdown') {
+-      loader = new TextLoader(filePath);
++      const loader = new TextLoader(filePath);
++      docs = await loader.load();
++    } else if (mimetype === 'image/png') {
++      const imageBuffer = fs.readFileSync(filePath);
++      const dataUrl = `data:${mimetype};base64,${imageBuffer.toString('base64')}`;
++      setLatestUploadImageContext(originalname, mimetype, dataUrl);
++
++      if (!ENABLE_PNG_OCR_INGEST) {
++        imageOnlyUpload = true;
++        docs = [];
++      } else {
++      let extractedText = normalizeExtractedText(await extractTextFromPng(filePath));
++
++      // Fallback for cases where the primary OCR model returns too little/empty text.
++      if (ENABLE_TESSERACT_OCR && (!extractedText || extractedText.replace(/\s+/g, '').length < 8)) {
++        extractedText = normalizeExtractedText(await extractTextFromPngWithTesseract(filePath));
++      }
++
++      if (!extractedText) {
++        throw new Error(
++          'Could not extract text from PNG image. Please use a clear screenshot with readable text.',
++        );
++      }
++
++      docs = [
++        new Document({
++          pageContent: extractedText,
++          metadata: {
++            source: originalname,
++            file_type: 'image/png',
++          },
++        }),
++      ];
++      }
+     } else {
+       // Cleanup file if format not supported
+       fs.unlinkSync(filePath);
+       return res.status(400).json({ success: false, error: 'Unsupported file format' });
+     }
+ 
+-    const docs = await loader.load();
++    if (imageOnlyUpload) {
++      fs.unlinkSync(filePath);
++      return res.status(200).json({
++        success: true,
++        message: 'PNG uploaded for direct vision-model question answering',
++        chunks_count: 0,
++        preview: '[image stored for VLM] ',
++      });
++    }
+ 
+     const splitter = new RecursiveCharacterTextSplitter({
+       chunkSize: parseInt(process.env.CHUNK_SIZE || '1000'),
+@@ -47,6 +143,17 @@ export const handleUpload = async (req: Request, res: Response) => {
+     // Ingest into vector store
+     await createVectorStore(chunks);
+ 
++    // Keep recent upload context in memory for follow-up questions like
++    // "answer the question in the uploaded image".
++    const latestContent = chunks
++      .slice(0, 3)
++      .map((c) => c.pageContent || '')
++      .join('\n')
++      .trim();
++    if (latestContent) {
++      setLatestUploadContext(originalname, latestContent);
++    }
++
+     // Cleanup uploaded file after processing
+     fs.unlinkSync(filePath);
+ 
+@@ -54,6 +161,7 @@ export const handleUpload = async (req: Request, res: Response) => {
+       success: true,
+       message: 'Document processed and ingested successfully',
+       chunks_count: chunks.length,
++      preview: String(chunks[0]?.pageContent || '').slice(0, 220),
+     });
+   } catch (error: any) {
+     console.error('Error processing document:', error);
+diff --git a/api/routes/upload.ts b/api/routes/upload.ts
+index 8ab5a91..025527b 100644
+--- a/api/routes/upload.ts
++++ b/api/routes/upload.ts
+@@ -1,10 +1,17 @@
+ import { Router } from 'express';
+ import multer from 'multer';
+ import { handleUpload } from '../controllers/upload.controller.js';
+-import path from 'path';
+ 
+ const router = Router();
+ 
++const allowedMimeTypes = new Set([
++  'application/pdf',
++  'text/plain',
++  'text/markdown',
++  'image/png',
++  'image/x-png',
++]);
++
+ const storage = multer.diskStorage({
+   destination: (req, file, cb) => {
+     cb(null, process.env.UPLOAD_DIRECTORY || './uploads');
+@@ -19,6 +26,13 @@ const upload = multer({
+   limits: {
+     fileSize: parseInt(process.env.MAX_FILE_SIZE || '10485760'), // 10MB
+   },
++  fileFilter: (_req, file, cb) => {
++    if (!allowedMimeTypes.has(file.mimetype)) {
++      cb(new Error('Unsupported file format. Please upload PDF, TXT, MD, or PNG.'));
++      return;
++    }
++    cb(null, true);
++  },
+ });
+ 
+ router.post('/', upload.single('file'), handleUpload);
+diff --git a/api/server.ts b/api/server.ts
+index c90168c..f0e721f 100644
+--- a/api/server.ts
++++ b/api/server.ts
+@@ -8,27 +8,74 @@ import app from './app.js';
+  */
+ const PORT = process.env.PORT || 3001;
+ 
+-const server = app.listen(PORT, () => {
+-  console.log(`Server ready on port ${PORT}`);
+-});
++let server: ReturnType<typeof app.listen> | null = null;
++let isShuttingDown = false;
++
++const startServer = () => {
++  server = app.listen(PORT, () => {
++    console.log(`Server ready on port ${PORT}`);
++  });
++
++  server.on('error', (error: any) => {
++    if (error?.code === 'EADDRINUSE') {
++      console.warn(`Port ${PORT} is busy. Retrying bind in 800ms...`);
++      setTimeout(() => {
++        if (!isShuttingDown) {
++          try {
++            server?.close();
++          } catch {
++            // no-op
++          }
++          startServer();
++        }
++      }, 800);
++      return;
++    }
++
++    throw error;
++  });
++};
++
++startServer();
++
++const gracefulShutdown = (signal: string, restart = false) => {
++  if (isShuttingDown) return;
++  isShuttingDown = true;
++  console.log(`${signal} signal received`);
++
++  if (!server) {
++    if (restart) {
++      process.kill(process.pid, 'SIGUSR2');
++      return;
++    }
++    process.exit(0);
++    return;
++  }
++
++  server.close(() => {
++    console.log('Server closed');
++    if (restart) {
++      process.kill(process.pid, 'SIGUSR2');
++    } else {
++      process.exit(0);
++    }
++  });
++};
+ 
+ /**
+  * close server
+  */
+ process.on('SIGTERM', () => {
+-  console.log('SIGTERM signal received');
+-  server.close(() => {
+-    console.log('Server closed');
+-    process.exit(0);
+-  });
++  gracefulShutdown('SIGTERM');
+ });
+ 
+ process.on('SIGINT', () => {
+-  console.log('SIGINT signal received');
+-  server.close(() => {
+-    console.log('Server closed');
+-    process.exit(0);
+-  });
++  gracefulShutdown('SIGINT');
++});
++
++// Graceful restart support for nodemon
++process.on('SIGUSR2', () => {
++  gracefulShutdown('SIGUSR2', true);
+ });
+ 
+ export default app;
+\ No newline at end of file
+diff --git a/api/services/llm.service.ts b/api/services/llm.service.ts
+index 261eb65..fe7b83d 100644
+--- a/api/services/llm.service.ts
++++ b/api/services/llm.service.ts
+@@ -6,11 +6,27 @@ dotenv.config();
+ const nvidiaApiKey = process.env.NVIDIA_API_KEY || '';
+ const nvidiaBaseUrl = process.env.NVIDIA_BASE_URL || 'https://integrate.api.nvidia.com/v1';
+ const nvidiaModel = process.env.NVIDIA_MODEL || 'meta/llama-3.1-8b-instruct';
++const nvidiaVlmModel = process.env.NVIDIA_VLM_MODEL || '';
+ 
+ const openRouterApiKey = process.env.OPEN_ROUTER_API_KEY || '';
+ const openRouterModel = process.env.OPEN_ROUTER_MODEL || 'meta/llama-3.1-8b-instruct';
+ const openRouterBaseUrl = process.env.OPEN_ROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+ 
++const customGetTokenIds = (text: string): number[] => {
++  // Lightweight estimator to avoid tiktoken "Unknown model" warnings for non-OpenAI model IDs.
++  const pieces = (text || '').split(/\s+/).filter(Boolean);
++  return pieces.map((_x, i) => i);
++};
++
++const originalWarn = console.warn.bind(console);
++console.warn = (...args: any[]) => {
++  const msg = String(args?.[0] || '');
++  if (msg.includes('Failed to calculate number of tokens, falling back to approximate count')) {
++    return;
++  }
++  originalWarn(...args);
++};
++
+ // Use NVIDIA NIM by default if configured, else fallback to OpenRouter
+ let llm: ChatOpenAI;
+ 
+@@ -22,9 +38,10 @@ if (nvidiaApiKey) {
+       baseURL: nvidiaBaseUrl,
+     },
+     modelName: nvidiaModel,
++    customGetTokenIds,
+     streaming: true,
+     temperature: 0.1,
+-  });
++  } as any);
+ } else if (openRouterApiKey) {
+   console.log('✅ Using OpenRouter LLM service');
+   llm = new ChatOpenAI({
+@@ -33,17 +50,83 @@ if (nvidiaApiKey) {
+       baseURL: openRouterBaseUrl,
+     },
+     modelName: openRouterModel,
++    customGetTokenIds,
+     streaming: true,
+     temperature: 0.1,
+-  });
++  } as any);
+ } else {
+   console.warn('⚠️ No LLM API key found (NVIDIA_API_KEY or OPEN_ROUTER_API_KEY). Chat will not work.');
+   // Initialize with dummy to avoid crashes, though calls will fail
+   llm = new ChatOpenAI({
+     openAIApiKey: 'dummy',
+     modelName: 'dummy',
+-  });
++    customGetTokenIds,
++  } as any);
+ }
+ 
+ export const nvidiaLlm = llm; // Keep name for backward compatibility in RAG service
++
++export const nvidiaVlm =
++  nvidiaApiKey && nvidiaVlmModel
++    ? new ChatOpenAI({
++        openAIApiKey: nvidiaApiKey,
++        configuration: {
++          baseURL: nvidiaBaseUrl,
++        },
++        modelName: nvidiaVlmModel,
++        customGetTokenIds,
++        streaming: true,
++        temperature: 0.1,
++      } as any)
++    : null;
++
++export const hasNvidiaVlm = Boolean(nvidiaVlm);
++
++export async function invokeNvidiaVlmWithImage(question: string, imageDataUrl: string): Promise<string> {
++  if (!nvidiaApiKey || !nvidiaVlmModel) {
++    throw new Error('NVIDIA VLM is not configured. Set NVIDIA_VLM_MODEL in .env.');
++  }
++
++  const endpoint = `${nvidiaBaseUrl.replace(/\/$/, '')}/chat/completions`;
++  const payload = {
++    model: nvidiaVlmModel,
++    temperature: 0.1,
++    messages: [
++      {
++        role: 'user',
++        content: [
++          {
++            type: 'text',
++            text: `You are an expert Mathematics assistant. Read the uploaded image and answer the question directly.\nQuestion: ${question}`,
++          },
++          {
++            type: 'image_url',
++            image_url: {
++              url: imageDataUrl,
++            },
++          },
++        ],
++      },
++    ],
++  };
++
++  const response = await fetch(endpoint, {
++    method: 'POST',
++    headers: {
++      Authorization: `Bearer ${nvidiaApiKey}`,
++      'Content-Type': 'application/json',
++    },
++    body: JSON.stringify(payload),
++  });
++
++  if (!response.ok) {
++    const body = await response.text();
++    throw new Error(`NVIDIA VLM request failed (${response.status}): ${body}`);
++  }
++
++  const data: any = await response.json();
++  const content = data?.choices?.[0]?.message?.content;
++  if (typeof content === 'string') return content;
++  return JSON.stringify(content ?? '');
++}
+ export default nvidiaLlm;
+diff --git a/api/services/rag.service.ts b/api/services/rag.service.ts
+index d51ec68..c1e88e2 100644
+--- a/api/services/rag.service.ts
++++ b/api/services/rag.service.ts
+@@ -1,57 +1,480 @@
+-import { nvidiaLlm } from './llm.service.js';
+-import { getVectorStore } from './vectorstore.service.js';
++import { hasNvidiaVlm, invokeNvidiaVlmWithImage, nvidiaLlm } from './llm.service.js';
++import { getVectorStore, queryVectorStore } from './vectorstore.service.js';
++import { getLatestUploadContext, getLatestUploadImageContext } from './upload-context.service.js';
+ import { PromptTemplate } from '@langchain/core/prompts';
+ import { RunnableSequence } from '@langchain/core/runnables';
+ import { StringOutputParser } from '@langchain/core/output_parsers';
+-import { formatDocumentsAsString } from 'langchain/util/document';
+ import dotenv from 'dotenv';
+ 
+ dotenv.config();
+ 
+ const RAG_PROMPT = `
+-You are an expert Machine Learning and Deep Learning assistant.
++You are a patient Mathematics tutor for university students.
++Teach first, do not just give the final result.
+ Answer the question based ONLY on the following context.
+-If you don't have enough grounded information from the context, say "I don't have enough grounded information to answer this question accurately."
+-Do not invent facts. Prefer concise, source-backed answers.
+-Always cite your sources by referencing the document names and sections where applicable.
++If there is not enough grounded information in context, say: "I don't have enough grounded information to answer this question accurately."
++Rules:
++- Start with a short hint.
++- Then show numbered step-by-step reasoning.
++- If asked for direct answer, provide it clearly.
++- End with: "Final answer: ..."
++- Do not invent facts.
++- Cite sources from the provided context.
+ 
+ Context: {context}
+ Question: {question}
+ 
+ Answer:`;
+ 
+-export const processRagQuestion = async (question: string, onToken?: (token: string) => void) => {
+-  const vectorStore = await getVectorStore();
+-  if (!vectorStore) {
+-    throw new Error('Vector store not available. Please upload some documents first.');
++const GENERAL_PROMPT = `
++You are a patient Mathematics tutor for university students.
++Teach first, do not just give the final result.
++Rules:
++- Start with a short hint.
++- Then show numbered step-by-step reasoning.
++- If asked for direct answer, provide it clearly.
++- End with: "Final answer: ..."
++- If the question is outside mathematics, say so briefly and give helpful guidance.
++
++Question: {question}
++
++Answer:`;
++
++const RECENT_UPLOAD_PROMPT = `
++You are a patient Mathematics tutor for university students.
++Use the recent uploaded file context to answer the question.
++If the context contains a math problem, tutor the student:
++- Start with a short hint.
++- Then show numbered step-by-step reasoning.
++- End with: "Final answer: ..."
++If the answer is not present and cannot be derived from the context, say so briefly.
++
++Context: {context}
++Question: {question}
++
++Answer:`;
++
++const TUTOR_QUERY_PREFIX = 'Teach me like a tutor. Give hints first, then full solution if I ask.';
++
++const REQUEST_TIMEOUT_MS = parseInt(process.env.RAG_TIMEOUT_MS || '45000');
++const RETRIEVAL_TIMEOUT_MS = parseInt(process.env.RAG_RETRIEVAL_TIMEOUT_MS || '12000');
++const LLM_TIMEOUT_MS = parseInt(process.env.RAG_LLM_TIMEOUT_MS || '25000');
++const MAX_QUESTION_CHARS = parseInt(process.env.RAG_MAX_QUESTION_CHARS || '1200');
++const ENABLE_DIRECT_LLM_FALLBACK = process.env.ENABLE_DIRECT_LLM_FALLBACK === 'true';
++const ENABLE_SMALLTALK_FALLBACK = process.env.ENABLE_SMALLTALK_FALLBACK !== 'false';
++const ENABLE_TUTOR_MODE = process.env.ENABLE_TUTOR_MODE !== 'false';
++const ENABLE_HYBRID_RETRIEVAL = process.env.ENABLE_HYBRID_RETRIEVAL !== 'false';
++const ENABLE_MATH_RERANKER = process.env.ENABLE_MATH_RERANKER !== 'false';
++const RETRIEVAL_CANDIDATE_K = parseInt(process.env.RETRIEVAL_CANDIDATE_K || '16');
++
++type MathIntent = {
++  topic: 'algebra' | 'calculus' | 'linear_algebra' | 'vector_calculus' | 'proof' | 'general';
++  mode: 'solve' | 'explain' | 'prove' | 'compute' | 'general';
++  tags: string[];
++};
++
++function isSmallTalkQuestion(text: string): boolean {
++  const normalized = text.trim().toLowerCase();
++  return /^(hi|hello|hey|yo|thanks|thank you|bye|good morning|good afternoon|good evening|how are you|who are you|what can you do)[!.?\s]*$/.test(
++    normalized,
++  );
++}
++
++function refersToUploadedDocument(text: string): boolean {
++  return /\b(upload|uploaded|image|png|file|document|screenshot|photo)\b/i.test(text);
++}
++
++function refersToImage(text: string): boolean {
++  return /\b(image|png|photo|screenshot|picture|diagram|graph)\b/i.test(text);
++}
++
++function asksForAnswer(text: string): boolean {
++  return /\b(answer|solve|solution|result)\b/i.test(text);
++}
++
++function extractExplicitAnswer(content: string): string | null {
++  const match = content.match(/\banswer\s*[:=-]\s*(.+?)(?:\n|$)/i);
++  if (!match) return null;
++  const answer = match[1].trim();
++  return answer ? answer : null;
++}
++
++function evaluateSimpleMathExpression(text: string): string | null {
++  const trimmed = text.trim().toLowerCase();
++
++  // Accept prompts like "1-1", "1-1=?", "what is 2+2?"
++  let extracted = trimmed
++    .replace(/^what is\s+/, '')
++    .replace(/^calculate\s+/, '')
++    .replace(/\?+$/g, '')
++    .replace(/=+$/g, '')
++    .trim()
++    .replace(/\s+/g, '');
++
++  // Tolerate accidental trailing operators (e.g. "2-1-?").
++  extracted = extracted.replace(/[+\-*/^]+$/g, '');
++
++  if (!extracted) return null;
++  if (!/^[0-9+\-*/().^a-z]+$/.test(extracted)) return null;
++  if (!/[0-9]/.test(extracted) && !/\b(pi|e)\b/.test(extracted)) return null;
++  if (extracted.length > 80) return null;
++
++  // Accept shorthand function forms like "sin1" => "sin(1)"
++  extracted = extracted.replace(
++    /^(sin|cos|tan|asin|acos|atan|sqrt|abs|ln|log)(-?\d+(?:\.\d+)?)$/,
++    '$1($2)',
++  );
++
++  try {
++    if (!/^[0-9+\-*/().^a-z]+$/.test(extracted)) return null;
++
++    const functionNames = ['sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'sqrt', 'abs'];
++
++    let jsExpression = extracted.replace(/\^/g, '**');
++    jsExpression = jsExpression.replace(/\bpi\b/g, 'Math.PI').replace(/\be\b/g, 'Math.E');
++    jsExpression = jsExpression.replace(/\bln\(/g, 'Math.log(').replace(/\blog\(/g, 'Math.log10(');
++
++    for (const fn of functionNames) {
++      jsExpression = jsExpression.replace(new RegExp(`\\b${fn}\\(`, 'g'), `Math.${fn}(`);
++    }
++
++    const result = Function(`"use strict"; return (${jsExpression});`)();
++    if (typeof result === 'number' && Number.isFinite(result)) {
++      const rounded = Math.abs(result) < 1e-12 ? 0 : Number(result.toFixed(12));
++      return `${extracted} = ${rounded}`;
++    }
++    return null;
++  } catch {
++    return null;
+   }
++}
+ 
+-  const retriever = vectorStore.asRetriever({
+-    k: parseInt(process.env.TOP_K_RETRIEVAL || '5'),
+-    searchType: 'similarity',
++function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessage: string): Promise<T> {
++  return new Promise<T>((resolve, reject) => {
++    const timer = setTimeout(() => reject(new Error(errorMessage)), timeoutMs);
++    promise
++      .then((value) => {
++        clearTimeout(timer);
++        resolve(value);
++      })
++      .catch((error) => {
++        clearTimeout(timer);
++        reject(error);
++      });
+   });
++}
++
++function classifyMathIntent(question: string): MathIntent {
++  const q = question.toLowerCase();
++
++  const isProof = /\b(prove|proof|show that|justify|why)\b/.test(q);
++  const isSolve = /\b(solve|roots?|find x|equation|system of equations?)\b/.test(q);
++  const isCompute = /\b(compute|evaluate|calculate|differentiate|integrate|derivative|integral)\b/.test(q);
++  const isExplain = /\b(explain|intuition|concept|meaning|what is|why)\b/.test(q);
++
++  let topic: MathIntent['topic'] = 'general';
++  if (/\b(matrix|determinant|eigen|rank|nullspace|vector space|linear transformation)\b/.test(q)) {
++    topic = 'linear_algebra';
++  } else if (/\b(grad|gradient|divergence|curl|\bnabla\b|line integral|surface integral)\b/.test(q)) {
++    topic = 'vector_calculus';
++  } else if (/\b(derivative|integral|limit|continuity|chain rule|product rule|partial derivative|taylor)\b/.test(q)) {
++    topic = 'calculus';
++  } else if (/\b(polynomial|quadratic|factor|equation|inequality|algebra)\b/.test(q)) {
++    topic = 'algebra';
++  } else if (isProof) {
++    topic = 'proof';
++  }
++
++  const mode: MathIntent['mode'] = isProof
++    ? 'prove'
++    : isSolve
++      ? 'solve'
++      : isCompute
++        ? 'compute'
++        : isExplain
++          ? 'explain'
++          : 'general';
++
++  const tags = [topic, mode].filter((x) => x !== 'general');
++  return { topic, mode, tags };
++}
++
++function expandQueryWithIntent(question: string, intent: MathIntent): string {
++  if (!intent.tags.length) return question;
++
++  const expansions: Record<string, string> = {
++    algebra: 'equations roots factorization polynomial simplification',
++    calculus: 'derivative integral limit chain rule product rule',
++    linear_algebra: 'matrix determinant eigenvalue rank nullspace',
++    vector_calculus: 'gradient divergence curl nabla line integral surface integral',
++    proof: 'theorem lemma proof reasoning',
++    solve: 'solve steps final answer',
++    compute: 'calculation steps',
++    explain: 'intuition concept explanation',
++    prove: 'proof assumptions conclusion',
++  };
++
++  const extra = intent.tags.map((t) => expansions[t] || '').filter(Boolean).join(' ');
++  return extra ? `${question} ${extra}` : question;
++}
++
++function tokenizeQuestion(question: string): string[] {
++  return Array.from(
++    new Set(
++      (question.toLowerCase().match(/[a-z0-9_]{2,}/g) || []).filter(
++        (t) => !['what', 'is', 'the', 'and', 'for', 'with', 'from', 'that', 'this'].includes(t),
++      ),
++    ),
++  );
++}
++
++function scoreKeywordOverlap(content: string, queryTokens: string[]): number {
++  if (!content || !queryTokens.length) return 0;
++  const text = content.toLowerCase();
++  let matched = 0;
++  for (const token of queryTokens) {
++    if (text.includes(token)) matched += 1;
++  }
++  return matched / queryTokens.length;
++}
++
++function scoreIntentMatch(
++  metadata: Record<string, any> | undefined,
++  content: string,
++  intent: MathIntent,
++): number {
++  const tagsText = String(metadata?.tags || '').toLowerCase();
++  const domain = String(metadata?.domain || '').toLowerCase();
++  const body = content.toLowerCase();
++  const signals = [tagsText, domain, body].join(' ');
++  let score = 0;
++  for (const tag of intent.tags) {
++    if (signals.includes(tag.replace('_', ' ')) || signals.includes(tag)) score += 0.2;
++  }
++  return Math.min(1, score);
++}
+ 
+-  const prompt = PromptTemplate.fromTemplate(RAG_PROMPT);
++async function hybridRetrieve(question: string, topK: number): Promise<Array<{ pageContent?: string; metadata?: Record<string, any> }>> {
++  const intent = classifyMathIntent(question);
++  const expandedQuery = expandQueryWithIntent(question, intent);
++  const candidateK = Math.max(topK, RETRIEVAL_CANDIDATE_K);
+ 
+-  const chain = RunnableSequence.from([
+-    {
+-      context: retriever.pipe(formatDocumentsAsString),
+-      question: (input: { question: string }) => input.question,
+-    },
+-    prompt,
+-    nvidiaLlm,
+-    new StringOutputParser(),
++  const [docsA, docsB] = await Promise.all([
++    queryVectorStore(question, candidateK),
++    ENABLE_HYBRID_RETRIEVAL ? queryVectorStore(expandedQuery, candidateK) : Promise.resolve([]),
+   ]);
+ 
+-  if (onToken) {
+-    const stream = await chain.stream({ question });
+-    for await (const chunk of stream) {
+-      onToken(chunk);
++  const dedup = new Map<string, { pageContent?: string; metadata?: Record<string, any> }>();
++  [...docsA, ...docsB].forEach((doc) => {
++    const key = `${doc.pageContent || ''}::${doc.metadata?.source || ''}`.slice(0, 500);
++    if (!dedup.has(key)) dedup.set(key, doc);
++  });
++
++  let merged = Array.from(dedup.values());
++
++  if (ENABLE_MATH_RERANKER) {
++    const tokens = tokenizeQuestion(question);
++    merged = merged
++      .map((doc, index) => {
++        const keywordScore = scoreKeywordOverlap(doc.pageContent || '', tokens);
++        const intentScore = scoreIntentMatch(doc.metadata, doc.pageContent || '', intent);
++        const recencyBoost = 1 / (index + 1);
++        const totalScore = keywordScore * 0.6 + intentScore * 0.3 + recencyBoost * 0.1;
++        return { doc, totalScore };
++      })
++      .sort((a, b) => b.totalScore - a.totalScore)
++      .map((item) => item.doc);
++  }
++
++  return merged.slice(0, topK);
++}
++
++function applyTutorPrefix(question: string): string {
++  const trimmed = question.trim();
++  if (!trimmed) return trimmed;
++  if (!ENABLE_TUTOR_MODE) return trimmed;
++  if (trimmed.toLowerCase().startsWith(TUTOR_QUERY_PREFIX.toLowerCase())) {
++    return trimmed;
++  }
++  return `${TUTOR_QUERY_PREFIX}\n\n${trimmed}`;
++}
++
++export const processRagQuestion = async (question: string, onToken?: (token: string) => void) => {
++  if (typeof question !== 'string') {
++    throw new Error('Question must be a string');
++  }
++
++  const normalizedQuestion = question.trim().slice(0, MAX_QUESTION_CHARS);
++  const guidedQuestion = applyTutorPrefix(normalizedQuestion);
++  if (!normalizedQuestion) {
++    throw new Error('Question cannot be empty');
++  }
++
++  const runLlm = async (questionText: string, contextText?: string) => {
++    if (contextText) {
++      const prompt = PromptTemplate.fromTemplate(RAG_PROMPT);
++      const chain = RunnableSequence.from([prompt, nvidiaLlm, new StringOutputParser()]);
++      return await withTimeout(
++        chain.invoke({ context: contextText, question: questionText }),
++        Math.min(REQUEST_TIMEOUT_MS, LLM_TIMEOUT_MS),
++        'LLM response timed out. Please try again.',
++      );
+     }
+-    return ''; // Stream handles the output
+-  } else {
+-    return await chain.invoke({ question });
++
++    const prompt = PromptTemplate.fromTemplate(GENERAL_PROMPT);
++    const chain = RunnableSequence.from([prompt, nvidiaLlm, new StringOutputParser()]);
++    return await withTimeout(
++      chain.invoke({ question: questionText }),
++      Math.min(REQUEST_TIMEOUT_MS, LLM_TIMEOUT_MS),
++      'LLM response timed out. Please try again.',
++    );
++  };
++
++  const runLlmWithRecentUploadContext = async (questionText: string, contextText: string) => {
++    const prompt = PromptTemplate.fromTemplate(RECENT_UPLOAD_PROMPT);
++    const chain = RunnableSequence.from([prompt, nvidiaLlm, new StringOutputParser()]);
++    return await withTimeout(
++      chain.invoke({ context: contextText, question: questionText }),
++      Math.min(REQUEST_TIMEOUT_MS, LLM_TIMEOUT_MS),
++      'LLM response timed out. Please try again.',
++    );
++  };
++
++  const runVlmWithImage = async (questionText: string, imageDataUrl: string) => {
++    const response = await withTimeout(
++      invokeNvidiaVlmWithImage(questionText, imageDataUrl),
++      Math.min(REQUEST_TIMEOUT_MS, LLM_TIMEOUT_MS),
++      'Vision model response timed out. Please try again.',
++    );
++    return response;
++  };
++
++  const buildSourceLabel = (metadata: Record<string, any> | undefined, index: number) => {
++    const source = metadata?.source || `document_${index + 1}`;
++    const page = metadata?.loc?.pageNumber || metadata?.pageNumber || metadata?.locFrom;
++    return page ? `${source} (page ${page})` : `${source}`;
++  };
++
++  const buildContext = (docs: Array<{ pageContent?: string; metadata?: Record<string, any> }>) => {
++    return docs
++      .map((doc, i) => {
++        const label = buildSourceLabel(doc.metadata, i);
++        return `[Source ${i + 1}] ${label}\n${doc.pageContent || ''}`;
++      })
++      .join('\n\n');
++  };
++
++  const buildSourcesFooter = (docs: Array<{ metadata?: Record<string, any> }>) => {
++    const labels = docs.map((doc, i) => buildSourceLabel(doc.metadata, i));
++    const unique = Array.from(new Set(labels));
++    return unique.length ? `\n\nSources:\n- ${unique.join('\n- ')}` : '';
++  };
++
++  let answer = '';
++
++  try {
++    const simpleMathAnswer = evaluateSimpleMathExpression(normalizedQuestion);
++    if (simpleMathAnswer) {
++      if (onToken) {
++        onToken(simpleMathAnswer);
++        return '';
++      }
++      return simpleMathAnswer;
++    }
++
++    if (ENABLE_SMALLTALK_FALLBACK && isSmallTalkQuestion(normalizedQuestion)) {
++      answer = await runLlm(guidedQuestion);
++      if (onToken) {
++        onToken(answer);
++        return '';
++      }
++      return answer;
++    }
++
++    const latestImageUpload = getLatestUploadImageContext();
++    if (latestImageUpload && refersToImage(normalizedQuestion) && !hasNvidiaVlm) {
++      answer =
++        'A vision model is not configured yet. Set NVIDIA_VLM_MODEL in .env to enable direct PNG/image question answering.';
++      if (onToken) {
++        onToken(answer);
++        return '';
++      }
++      return answer;
++    }
++
++    if (latestImageUpload && refersToImage(normalizedQuestion) && hasNvidiaVlm) {
++      answer = await runVlmWithImage(guidedQuestion, latestImageUpload.dataUrl);
++      answer += `\n\nSources:\n- ${latestImageUpload.source}`;
++      if (onToken) {
++        onToken(answer);
++        return '';
++      }
++      return answer;
++    }
++
++    const latestUpload = getLatestUploadContext();
++    if (latestUpload && refersToUploadedDocument(normalizedQuestion)) {
++      if (asksForAnswer(normalizedQuestion)) {
++        const explicitAnswer = extractExplicitAnswer(latestUpload.content);
++        if (explicitAnswer) {
++          const uploadAnswer = `${explicitAnswer}\n\nSources:\n- ${latestUpload.source}`;
++          if (onToken) {
++            onToken(uploadAnswer);
++            return '';
++          }
++          return uploadAnswer;
++        }
++      }
++
++      const uploadContext = `[Recent Upload] ${latestUpload.source}\n${latestUpload.content}`;
++      answer = await runLlmWithRecentUploadContext(guidedQuestion, uploadContext);
++      answer += `\n\nSources:\n- ${latestUpload.source}`;
++      if (onToken) {
++        onToken(answer);
++        return '';
++      }
++      return answer;
++    }
++
++    const vectorStore = await getVectorStore();
++    if (!vectorStore) {
++      answer = await runLlm(guidedQuestion);
++    } else {
++      const topK = parseInt(process.env.TOP_K_RETRIEVAL || '3');
++
++      const docs = await withTimeout(
++        hybridRetrieve(normalizedQuestion, topK),
++        RETRIEVAL_TIMEOUT_MS,
++        'Document retrieval timed out. Falling back to direct LLM answer.',
++      ).catch((error) => {
++        console.warn('RAG retrieval timeout/failure:', error?.message || error);
++        return [];
++      });
++
++      if (docs.length > 0) {
++        const context = buildContext(docs);
++        answer = await runLlm(guidedQuestion, context);
++        answer += buildSourcesFooter(docs);
++      } else {
++        if (ENABLE_DIRECT_LLM_FALLBACK) {
++          // Out-of-RAG or retrieval timeout: answer with direct LLM (no retrieved context).
++          answer = await runLlm(guidedQuestion);
++        } else {
++          answer = "I don't have enough grounded information to answer this question accurately.";
++        }
++      }
++    }
++  } catch (error: any) {
++    console.error('RAG/LLM processing failure:', error?.message || error);
++    answer = 'The answer service is currently slow. Please try again in a moment.';
+   }
++
++  if (onToken) {
++    onToken(answer);
++    return '';
++  }
++
++  return answer;
+ };
+ 
+ export default { processRagQuestion };
+diff --git a/api/services/vectorstore.service.ts b/api/services/vectorstore.service.ts
+index 0ed1f52..1e9d494 100644
+--- a/api/services/vectorstore.service.ts
++++ b/api/services/vectorstore.service.ts
+@@ -1,6 +1,9 @@
+ import { Chroma } from '@langchain/community/vectorstores/chroma';
+ import { OpenAIEmbeddings } from '@langchain/openai';
+ import { HuggingFaceInferenceEmbeddings } from '@langchain/community/embeddings/hf';
++import { Document } from '@langchain/core/documents';
++import { Embeddings } from '@langchain/core/embeddings';
++import { ChromaClient, IncludeEnum } from 'chromadb';
+ import dotenv from 'dotenv';
+ 
+ dotenv.config();
+@@ -8,24 +11,163 @@ dotenv.config();
+ const collectionName = process.env.CHROMA_COLLECTION_NAME || 'ml_documents';
+ const embeddingProvider = process.env.EMBEDDING_PROVIDER || 'openai';
+ const chromaUrl = process.env.CHROMA_URL || 'http://localhost:8000';
++const huggingFaceEndpointUrl = process.env.HUGGINGFACE_ENDPOINT_URL || 'https://router.huggingface.co';
++const embeddingBatchSize = parseInt(process.env.EMBEDDING_BATCH_SIZE || '20');
++const localEmbeddingModel = process.env.EMBEDDING_MODEL || 'Xenova/all-MiniLM-L6-v2';
+ 
+ let embeddings: any;
+ 
++class LocalHashEmbeddings extends Embeddings {
++  private readonly dimensions: number;
++
++  constructor(dimensions = 256) {
++    super({});
++    this.dimensions = dimensions;
++  }
++
++  private toVector(text: string): number[] {
++    const vector = new Array(this.dimensions).fill(0);
++    const tokens = (text || '').toLowerCase().match(/[a-z0-9_]+/g) || [];
++
++    for (const token of tokens) {
++      let hash = 2166136261;
++      for (let i = 0; i < token.length; i++) {
++        hash ^= token.charCodeAt(i);
++        hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
++      }
++      const idx = Math.abs(hash) % this.dimensions;
++      vector[idx] += 1;
++    }
++
++    const norm = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0));
++    if (norm > 0) {
++      return vector.map((v) => v / norm);
++    }
++    return vector;
++  }
++
++  async embedDocuments(documents: string[]): Promise<number[][]> {
++    return documents.map((doc) => this.toVector(doc));
++  }
++
++  async embedQuery(document: string): Promise<number[]> {
++    return this.toVector(document);
++  }
++}
++
++class LocalTransformersEmbeddings extends Embeddings {
++  private readonly modelName: string;
++  private extractorPromise: Promise<any> | null = null;
++  private readonly fallbackEmbeddings: LocalHashEmbeddings;
++  private warnedFallback = false;
++
++  constructor(modelName: string) {
++    super({});
++    this.modelName = modelName;
++    this.fallbackEmbeddings = new LocalHashEmbeddings(parseInt(process.env.LOCAL_EMBEDDING_DIM || '256'));
++  }
++
++  private async getExtractor() {
++    if (!this.extractorPromise) {
++      this.extractorPromise = (async () => {
++        const { pipeline, env } = await import('@xenova/transformers');
++        env.allowLocalModels = true;
++        env.useBrowserCache = false;
++        return await pipeline('feature-extraction', this.modelName);
++      })();
++    }
++
++    return this.extractorPromise;
++  }
++
++  private async embedText(text: string): Promise<number[]> {
++    try {
++      const extractor = await this.getExtractor();
++      const output = await extractor(text || '', { pooling: 'mean', normalize: true });
++      return Array.from(output.data as Float32Array);
++    } catch (error) {
++      if (!this.warnedFallback) {
++        console.warn(
++          `Local transformer model load failed (${this.modelName}). Falling back to local hash embeddings.`,
++          error,
++        );
++        this.warnedFallback = true;
++      }
++      return await this.fallbackEmbeddings.embedQuery(text || '');
++    }
++  }
++
++  async embedDocuments(documents: string[]): Promise<number[][]> {
++    const vectors: number[][] = [];
++    for (const doc of documents) {
++      vectors.push(await this.embedText(doc));
++    }
++    return vectors;
++  }
++
++  async embedQuery(document: string): Promise<number[]> {
++    return await this.embedText(document);
++  }
++}
++
++function sanitizeMetadataValue(value: unknown): string | number | boolean {
++  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
++    return value;
++  }
++
++  if (value instanceof Date) {
++    return value.toISOString();
++  }
++
++  if (Array.isArray(value)) {
++    return value.map((item) => String(item)).join(', ');
++  }
++
++  return JSON.stringify(value);
++}
++
++function sanitizeMetadata(metadata: Record<string, unknown> | undefined): Record<string, string | number | boolean> {
++  const safe: Record<string, string | number | boolean> = {};
++  if (!metadata) return safe;
++
++  for (const [key, value] of Object.entries(metadata)) {
++    if (value === null || value === undefined) continue;
++    safe[key] = sanitizeMetadataValue(value);
++  }
++
++  return safe;
++}
++
+ if (embeddingProvider === 'huggingface') {
+   console.log('✅ Using Hugging Face free embeddings service');
+   embeddings = new HuggingFaceInferenceEmbeddings({
+     apiKey: process.env.HUGGINGFACE_API_KEY,
+     model: process.env.EMBEDDING_MODEL || 'BAAI/bge-base-en-v1.5',
++    endpointUrl: huggingFaceEndpointUrl,
+   });
+-} else {
++} else if (embeddingProvider === 'openai') {
+   console.log('✅ Using OpenAI embeddings service');
+   embeddings = new OpenAIEmbeddings({
+     openAIApiKey: process.env.OPENAI_API_KEY,
+     modelName: process.env.EMBEDDING_MODEL || 'text-embedding-3-small',
+   });
++} else if (embeddingProvider === 'local-transformers') {
++  console.log(`✅ Using local transformers embeddings service (${localEmbeddingModel})`);
++  embeddings = new LocalTransformersEmbeddings(localEmbeddingModel);
++} else {
++  console.log('✅ Using local hash embeddings service');
++  embeddings = new LocalHashEmbeddings(parseInt(process.env.LOCAL_EMBEDDING_DIM || '256'));
+ }
+ 
+ let vectorStore: Chroma | null = null;
++let chromaClient: ChromaClient | null = null;
++
++function getChromaClient() {
++  if (!chromaClient) {
++    chromaClient = new ChromaClient({ path: chromaUrl });
++  }
++  return chromaClient;
++}
+ 
+ export const getVectorStore = async () => {
+   if (vectorStore) return vectorStore;
+@@ -42,11 +184,87 @@ export const getVectorStore = async () => {
+ };
+ 
+ export const createVectorStore = async (docs: any[]) => {
+-  vectorStore = await Chroma.fromDocuments(docs, embeddings, {
+-    collectionName: collectionName,
+-    url: chromaUrl,
+-  });
++  const safeDocs: Document[] = docs.map((doc) =>
++    new Document({
++      pageContent: typeof doc?.pageContent === 'string' ? doc.pageContent : String(doc?.pageContent ?? ''),
++      metadata: sanitizeMetadata(doc?.metadata),
++    }),
++  );
++
++  if (!vectorStore) {
++    vectorStore = await getVectorStore();
++  }
++
++  const batches: Document[][] = [];
++  for (let i = 0; i < safeDocs.length; i += embeddingBatchSize) {
++    batches.push(safeDocs.slice(i, i + embeddingBatchSize));
++  }
++
++  if (vectorStore) {
++    for (const batch of batches) {
++      try {
++        await vectorStore.addDocuments(batch);
++      } catch (error) {
++        console.warn('Batch ingestion failed, retrying documents one-by-one...', error);
++        for (const doc of batch) {
++          await vectorStore.addDocuments([doc]);
++        }
++      }
++    }
++  } else {
++    vectorStore = await Chroma.fromDocuments(batches[0] || safeDocs, embeddings, {
++      collectionName: collectionName,
++      url: chromaUrl,
++    });
++
++    for (let i = 1; i < batches.length; i++) {
++      try {
++        await vectorStore.addDocuments(batches[i]);
++      } catch (error) {
++        console.warn('Batch ingestion failed, retrying documents one-by-one...', error);
++        for (const doc of batches[i]) {
++          await vectorStore.addDocuments([doc]);
++        }
++      }
++    }
++  }
++
+   return vectorStore;
+ };
+ 
+-export default { getVectorStore, createVectorStore };
++export const queryVectorStore = async (query: string, topK = 3): Promise<Document[]> => {
++  try {
++    const client = getChromaClient();
++    const collection = await client.getCollection({
++      name: collectionName,
++      embeddingFunction: {
++        generate: async (texts: string[]) => embeddings.embedDocuments(texts),
++      },
++    });
++    const queryEmbedding = await embeddings.embedQuery(query);
++
++    const result = await collection.query({
++      queryEmbeddings: [queryEmbedding],
++      nResults: topK,
++      include: [IncludeEnum.Documents, IncludeEnum.Metadatas, IncludeEnum.Distances],
++    });
++
++    const docs = result.documents?.[0] || [];
++    const metadatas = result.metadatas?.[0] || [];
++
++    return docs
++      .map((doc, index) => {
++        if (!doc) return null;
++        return new Document({
++          pageContent: String(doc),
++          metadata: sanitizeMetadata((metadatas[index] as Record<string, unknown>) || {}),
++        });
++      })
++      .filter((doc): doc is Document => Boolean(doc));
++  } catch (error) {
++    console.warn('Direct Chroma query failed:', error);
++    return [];
++  }
++};
++
++export default { getVectorStore, createVectorStore, queryVectorStore };
+diff --git a/nodemon.json b/nodemon.json
+index 86022e1..9e4016d 100644
+--- a/nodemon.json
++++ b/nodemon.json
+@@ -3,6 +3,7 @@
+   "ext": "ts,mts,js,json",
+   "ignore": ["api/dist/*"],
+   "exec": "tsx api/server.ts",
++  "signal": "SIGTERM",
+   "env": {
+     "NODE_ENV": "development"
+   },
+diff --git a/package-lock.json b/package-lock.json
+index 9528b5d..4630d18 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -12,7 +12,9 @@
+         "@langchain/community": "^0.0.53",
+         "@langchain/openai": "^0.0.28",
+         "@supabase/supabase-js": "^2.43.4",
++        "@xenova/transformers": "^2.17.2",
+         "axios": "^1.6.8",
++        "cheerio": "^1.2.0",
+         "chromadb": "^1.8.1",
+         "clsx": "^2.1.1",
+         "cors": "^2.8.5",
+@@ -28,6 +30,7 @@
+         "react-dom": "^18.3.1",
+         "react-router-dom": "^7.3.0",
+         "tailwind-merge": "^3.0.2",
++        "tesseract.js": "^7.0.0",
+         "uuid": "^9.0.1",
+         "zustand": "^5.0.3"
+       },
+@@ -51,6 +54,7 @@
+         "eslint-plugin-react-hooks": "^5.2.0",
+         "eslint-plugin-react-refresh": "^0.4.19",
+         "globals": "^16.0.0",
++        "kill-port": "^2.0.1",
+         "nodemon": "^3.1.10",
+         "postcss": "^8.5.3",
+         "tailwindcss": "^3.4.17",
+@@ -1142,6 +1146,15 @@
+         "node": ">=18"
+       }
+     },
++    "node_modules/@huggingface/jinja": {
++      "version": "0.2.2",
++      "resolved": "https://registry.npmjs.org/@huggingface/jinja/-/jinja-0.2.2.tgz",
++      "integrity": "sha512-/KPde26khDUIPkTGU82jdtTW9UAuvUTumCAbFs/7giR0SxsvZC4hru51PBvpijH6BVkHcROcvZM/lpy5h1jRRA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      }
++    },
+     "node_modules/@huggingface/tasks": {
+       "version": "0.12.30",
+       "resolved": "https://registry.npmjs.org/@huggingface/tasks/-/tasks-0.12.30.tgz",
+@@ -1824,6 +1837,70 @@
+         "node": ">= 8"
+       }
+     },
++    "node_modules/@protobufjs/aspromise": {
++      "version": "1.1.2",
++      "resolved": "https://registry.npmjs.org/@protobufjs/aspromise/-/aspromise-1.1.2.tgz",
++      "integrity": "sha512-j+gKExEuLmKwvz3OgROXtrJ2UG2x8Ch2YZUxahh+s1F2HZ+wAceUNLkvy6zKCPVRkU++ZWQrdxsUeQXmcg4uoQ==",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@protobufjs/base64": {
++      "version": "1.1.2",
++      "resolved": "https://registry.npmjs.org/@protobufjs/base64/-/base64-1.1.2.tgz",
++      "integrity": "sha512-AZkcAA5vnN/v4PDqKyMR5lx7hZttPDgClv83E//FMNhR2TMcLUhfRUBHCmSl0oi9zMgDDqRUJkSxO3wm85+XLg==",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@protobufjs/codegen": {
++      "version": "2.0.4",
++      "resolved": "https://registry.npmjs.org/@protobufjs/codegen/-/codegen-2.0.4.tgz",
++      "integrity": "sha512-YyFaikqM5sH0ziFZCN3xDC7zeGaB/d0IUb9CATugHWbd1FRFwWwt4ld4OYMPWu5a3Xe01mGAULCdqhMlPl29Jg==",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@protobufjs/eventemitter": {
++      "version": "1.1.0",
++      "resolved": "https://registry.npmjs.org/@protobufjs/eventemitter/-/eventemitter-1.1.0.tgz",
++      "integrity": "sha512-j9ednRT81vYJ9OfVuXG6ERSTdEL1xVsNgqpkxMsbIabzSo3goCjDIveeGv5d03om39ML71RdmrGNjG5SReBP/Q==",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@protobufjs/fetch": {
++      "version": "1.1.0",
++      "resolved": "https://registry.npmjs.org/@protobufjs/fetch/-/fetch-1.1.0.tgz",
++      "integrity": "sha512-lljVXpqXebpsijW71PZaCYeIcE5on1w5DlQy5WH6GLbFryLUrBD4932W/E2BSpfRJWseIL4v/KPgBFxDOIdKpQ==",
++      "license": "BSD-3-Clause",
++      "dependencies": {
++        "@protobufjs/aspromise": "^1.1.1",
++        "@protobufjs/inquire": "^1.1.0"
++      }
++    },
++    "node_modules/@protobufjs/float": {
++      "version": "1.0.2",
++      "resolved": "https://registry.npmjs.org/@protobufjs/float/-/float-1.0.2.tgz",
++      "integrity": "sha512-Ddb+kVXlXst9d+R9PfTIxh1EdNkgoRe5tOX6t01f1lYWOvJnSPDBlG241QLzcyPdoNTsblLUdujGSE4RzrTZGQ==",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@protobufjs/inquire": {
++      "version": "1.1.0",
++      "resolved": "https://registry.npmjs.org/@protobufjs/inquire/-/inquire-1.1.0.tgz",
++      "integrity": "sha512-kdSefcPdruJiFMVSbn801t4vFK7KB/5gd2fYvrxhuJYg8ILrmn9SKSX2tZdV6V+ksulWqS7aXjBcRXl3wHoD9Q==",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@protobufjs/path": {
++      "version": "1.1.2",
++      "resolved": "https://registry.npmjs.org/@protobufjs/path/-/path-1.1.2.tgz",
++      "integrity": "sha512-6JOcJ5Tm08dOHAbdR3GrvP+yUUfkjG5ePsHYczMFLq3ZmMkAD98cDgcT2iA1lJ9NVwFd4tH/iSSoe44YWkltEA==",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@protobufjs/pool": {
++      "version": "1.1.0",
++      "resolved": "https://registry.npmjs.org/@protobufjs/pool/-/pool-1.1.0.tgz",
++      "integrity": "sha512-0kELaGSIDBKvcgS4zkjz1PeddatrjYcmMWOlAuAPwAeccUrPHdUqo/J6LiymHHEiJT5NrF1UVwxY14f+fy4WQw==",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@protobufjs/utf8": {
++      "version": "1.1.0",
++      "resolved": "https://registry.npmjs.org/@protobufjs/utf8/-/utf8-1.1.0.tgz",
++      "integrity": "sha512-Vvn3zZrhQZkkBE8LSuW3em98c0FwgO4nxzv6OdSxPKJIEKY2bGbHn+mhGIPerzI4twdxaP8/0+06HBpwf345Lw==",
++      "license": "BSD-3-Clause"
++    },
+     "node_modules/@renovatebot/pep440": {
+       "version": "4.2.1",
+       "resolved": "https://registry.npmjs.org/@renovatebot/pep440/-/pep440-4.2.1.tgz",
+@@ -2245,18 +2322,6 @@
+       "integrity": "sha512-RHSx8bHS02xwfHdAbX5Lpbo6PXbgyf7lTaXTlwtFDPwOIw64NnVRwFAXGojHhjtVYI+PEPNSWwkL90f4agN3bw==",
+       "license": "MIT"
+     },
+-    "node_modules/@supabase/postgrest-js": {
+-      "version": "2.102.1",
+-      "resolved": "https://registry.npmjs.org/@supabase/postgrest-js/-/postgrest-js-2.102.1.tgz",
+-      "integrity": "sha512-InLvXKAYf8BIqiv9jWOYudWB3rU8A9uMbcip5BQ5sLLNPrbO1Ekkr79OvlhZBgMNSppxVyC7wPPGzLxMcTZhlA==",
+-      "license": "MIT",
+-      "dependencies": {
+-        "tslib": "2.8.1"
+-      },
+-      "engines": {
+-        "node": ">=20.0.0"
+-      }
+-    },
+     "node_modules/@supabase/realtime-js": {
+       "version": "2.102.1",
+       "resolved": "https://registry.npmjs.org/@supabase/realtime-js/-/realtime-js-2.102.1.tgz",
+@@ -2290,7 +2355,6 @@
+       "resolved": "https://registry.npmjs.org/@supabase/supabase-js/-/supabase-js-2.102.1.tgz",
+       "integrity": "sha512-bChxPVeLDnYN9M2d/u4fXsvylwSQG5grAl+HN8f+ZD9a9PuVU+Ru+xGmEsk+b9Iz3rJC9ZQnQUJYQ28fApdWYA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@supabase/auth-js": "2.102.1",
+         "@supabase/functions-js": "2.102.1",
+@@ -2302,6 +2366,18 @@
+         "node": ">=20.0.0"
+       }
+     },
++    "node_modules/@supabase/supabase-js/node_modules/@supabase/postgrest-js": {
++      "version": "2.102.1",
++      "resolved": "https://registry.npmjs.org/@supabase/postgrest-js/-/postgrest-js-2.102.1.tgz",
++      "integrity": "sha512-InLvXKAYf8BIqiv9jWOYudWB3rU8A9uMbcip5BQ5sLLNPrbO1Ekkr79OvlhZBgMNSppxVyC7wPPGzLxMcTZhlA==",
++      "license": "MIT",
++      "dependencies": {
++        "tslib": "2.8.1"
++      },
++      "engines": {
++        "node": ">=20.0.0"
++      }
++    },
+     "node_modules/@ts-morph/common": {
+       "version": "0.11.1",
+       "resolved": "https://registry.npmjs.org/@ts-morph/common/-/common-0.11.1.tgz",
+@@ -2471,6 +2547,12 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/@types/long": {
++      "version": "4.0.2",
++      "resolved": "https://registry.npmjs.org/@types/long/-/long-4.0.2.tgz",
++      "integrity": "sha512-MqTGEo5bj5t157U6fA/BiDynNkn0YknVdh48CMPkTSpFTVmvao5UQmm7uEF6xBEo7qIMAlY/JSleYaE6VOdpaA==",
++      "license": "MIT"
++    },
+     "node_modules/@types/markdown-it": {
+       "version": "14.1.2",
+       "resolved": "https://registry.npmjs.org/@types/markdown-it/-/markdown-it-14.1.2.tgz",
+@@ -3090,6 +3172,21 @@
+         "vite": "^4.2.0 || ^5.0.0 || ^6.0.0 || ^7.0.0"
+       }
+     },
++    "node_modules/@xenova/transformers": {
++      "version": "2.17.2",
++      "resolved": "https://registry.npmjs.org/@xenova/transformers/-/transformers-2.17.2.tgz",
++      "integrity": "sha512-lZmHqzrVIkSvZdKZEx7IYY51TK0WDrC8eR0c5IMnBsO8di8are1zzw8BlLhyO2TklZKLN5UffNGs1IJwT6oOqQ==",
++      "license": "Apache-2.0",
++      "peer": true,
++      "dependencies": {
++        "@huggingface/jinja": "^0.2.2",
++        "onnxruntime-web": "1.14.0",
++        "sharp": "^0.32.0"
++      },
++      "optionalDependencies": {
++        "onnxruntime-node": "1.14.0"
++      }
++    },
+     "node_modules/@xmldom/xmldom": {
+       "version": "0.8.12",
+       "resolved": "https://registry.npmjs.org/@xmldom/xmldom/-/xmldom-0.8.12.tgz",
+@@ -3383,6 +3480,97 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/bare-events": {
++      "version": "2.8.2",
++      "resolved": "https://registry.npmjs.org/bare-events/-/bare-events-2.8.2.tgz",
++      "integrity": "sha512-riJjyv1/mHLIPX4RwiK+oW9/4c3TEUeORHKefKAKnZ5kyslbN+HXowtbaVEqt4IMUB7OXlfixcs6gsFeo/jhiQ==",
++      "license": "Apache-2.0",
++      "peerDependencies": {
++        "bare-abort-controller": "*"
++      },
++      "peerDependenciesMeta": {
++        "bare-abort-controller": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/bare-fs": {
++      "version": "4.7.0",
++      "resolved": "https://registry.npmjs.org/bare-fs/-/bare-fs-4.7.0.tgz",
++      "integrity": "sha512-xzqKsCFxAek9aezYhjJuJRXBIaYlg/0OGDTZp+T8eYmYMlm66cs6cYko02drIyjN2CBbi+I6L7YfXyqpqtKRXA==",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "bare-events": "^2.5.4",
++        "bare-path": "^3.0.0",
++        "bare-stream": "^2.6.4",
++        "bare-url": "^2.2.2",
++        "fast-fifo": "^1.3.2"
++      },
++      "engines": {
++        "bare": ">=1.16.0"
++      },
++      "peerDependencies": {
++        "bare-buffer": "*"
++      },
++      "peerDependenciesMeta": {
++        "bare-buffer": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/bare-os": {
++      "version": "3.8.7",
++      "resolved": "https://registry.npmjs.org/bare-os/-/bare-os-3.8.7.tgz",
++      "integrity": "sha512-G4Gr1UsGeEy2qtDTZwL7JFLo2wapUarz7iTMcYcMFdS89AIQuBoyjgXZz0Utv7uHs3xA9LckhVbeBi8lEQrC+w==",
++      "license": "Apache-2.0",
++      "engines": {
++        "bare": ">=1.14.0"
++      }
++    },
++    "node_modules/bare-path": {
++      "version": "3.0.0",
++      "resolved": "https://registry.npmjs.org/bare-path/-/bare-path-3.0.0.tgz",
++      "integrity": "sha512-tyfW2cQcB5NN8Saijrhqn0Zh7AnFNsnczRcuWODH0eYAXBsJ5gVxAUuNr7tsHSC6IZ77cA0SitzT+s47kot8Mw==",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "bare-os": "^3.0.1"
++      }
++    },
++    "node_modules/bare-stream": {
++      "version": "2.12.0",
++      "resolved": "https://registry.npmjs.org/bare-stream/-/bare-stream-2.12.0.tgz",
++      "integrity": "sha512-w28i8lkBgREV3rPXGbgK+BO66q+ZpKqRWrZLiCdmmUlLPrQ45CzkvRhN+7lnv00Gpi2zy5naRxnUFAxCECDm9g==",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "streamx": "^2.25.0",
++        "teex": "^1.0.1"
++      },
++      "peerDependencies": {
++        "bare-abort-controller": "*",
++        "bare-buffer": "*",
++        "bare-events": "*"
++      },
++      "peerDependenciesMeta": {
++        "bare-abort-controller": {
++          "optional": true
++        },
++        "bare-buffer": {
++          "optional": true
++        },
++        "bare-events": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/bare-url": {
++      "version": "2.4.0",
++      "resolved": "https://registry.npmjs.org/bare-url/-/bare-url-2.4.0.tgz",
++      "integrity": "sha512-NSTU5WN+fy/L0DDenfE8SXQna4voXuW0FHM7wH8i3/q9khUSchfPbPezO4zSFMnDGIf9YE+mt/RWhZgNRKRIXA==",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "bare-path": "^3.0.0"
++      }
++    },
+     "node_modules/base-64": {
+       "version": "0.1.0",
+       "resolved": "https://registry.npmjs.org/base-64/-/base-64-0.1.0.tgz",
+@@ -3449,12 +3637,43 @@
+         "file-uri-to-path": "1.0.0"
+       }
+     },
++    "node_modules/bl": {
++      "version": "4.1.0",
++      "resolved": "https://registry.npmjs.org/bl/-/bl-4.1.0.tgz",
++      "integrity": "sha512-1W07cM9gS6DcLperZfFSj+bWLtaPGSOHWhPiGzXmvVJbRLdG82sH/Kn8EtW1VqWVA54AKf2h5k5BbnIbwF3h6w==",
++      "license": "MIT",
++      "dependencies": {
++        "buffer": "^5.5.0",
++        "inherits": "^2.0.4",
++        "readable-stream": "^3.4.0"
++      }
++    },
++    "node_modules/bl/node_modules/readable-stream": {
++      "version": "3.6.2",
++      "resolved": "https://registry.npmjs.org/readable-stream/-/readable-stream-3.6.2.tgz",
++      "integrity": "sha512-9u/sniCrY3D5WdsERHzHE4G2YCXqoG5FTHUiCC4SIbr6XcLZBY05ya9EKjYek9O5xOAwjGq+1JdGBAS7Q9ScoA==",
++      "license": "MIT",
++      "dependencies": {
++        "inherits": "^2.0.3",
++        "string_decoder": "^1.1.1",
++        "util-deprecate": "^1.0.1"
++      },
++      "engines": {
++        "node": ">= 6"
++      }
++    },
+     "node_modules/bluebird": {
+       "version": "3.4.7",
+       "resolved": "https://registry.npmjs.org/bluebird/-/bluebird-3.4.7.tgz",
+       "integrity": "sha512-iD3898SR7sWVRHbiQv+sHUtHnMvC1o3nW5rAcqnq3uOn07DSAppZYUkIGslDz6gXC7HfunPe7YVBgoEJASPcHA==",
+       "license": "MIT"
+     },
++    "node_modules/bmp-js": {
++      "version": "0.1.0",
++      "resolved": "https://registry.npmjs.org/bmp-js/-/bmp-js-0.1.0.tgz",
++      "integrity": "sha512-vHdS19CnY3hwiNdkaqk93DvjVLfbEcI8mys4UjuWrlX1haDmroo8o4xCzh4wD6DGV6HxRCyauwhHRqMTfERtjw==",
++      "license": "MIT"
++    },
+     "node_modules/body-parser": {
+       "version": "1.20.4",
+       "resolved": "https://registry.npmjs.org/body-parser/-/body-parser-1.20.4.tgz",
+@@ -3494,6 +3713,12 @@
+       "integrity": "sha512-Tpp60P6IUJDTuOq/5Z8cdskzJujfwqfOTkrwIwj7IRISpnkJnT6SyJ4PCPnGMoFjC9ddhal5KVIYtAt97ix05A==",
+       "license": "MIT"
+     },
++    "node_modules/boolbase": {
++      "version": "1.0.0",
++      "resolved": "https://registry.npmjs.org/boolbase/-/boolbase-1.0.0.tgz",
++      "integrity": "sha512-JZOSA7Mo9sNGB8+UjSgzdLtokWAky1zbztM3WRLCbZ70/3cTANmQmOdR7y2g+J0e2WXywy1yS468tY+IruqEww==",
++      "license": "ISC"
++    },
+     "node_modules/brace-expansion": {
+       "version": "1.1.13",
+       "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-1.1.13.tgz",
+@@ -3553,6 +3778,30 @@
+         "node": "^6 || ^7 || ^8 || ^9 || ^10 || ^11 || ^12 || >=13.7"
+       }
+     },
++    "node_modules/buffer": {
++      "version": "5.7.1",
++      "resolved": "https://registry.npmjs.org/buffer/-/buffer-5.7.1.tgz",
++      "integrity": "sha512-EHcyIPBQ4BSGlvjB16k5KgAJ27CIsHY/2JBmCRReo48y9rQ3MaUzWX3KVlBa4U7MyX02HdVj0K7C3WaB3ju7FQ==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/feross"
++        },
++        {
++          "type": "patreon",
++          "url": "https://www.patreon.com/feross"
++        },
++        {
++          "type": "consulting",
++          "url": "https://feross.org/support"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "base64-js": "^1.3.1",
++        "ieee754": "^1.1.13"
++      }
++    },
+     "node_modules/buffer-from": {
+       "version": "1.1.2",
+       "resolved": "https://registry.npmjs.org/buffer-from/-/buffer-from-1.1.2.tgz",
+@@ -3716,6 +3965,58 @@
+         "node": "*"
+       }
+     },
++    "node_modules/cheerio": {
++      "version": "1.2.0",
++      "resolved": "https://registry.npmjs.org/cheerio/-/cheerio-1.2.0.tgz",
++      "integrity": "sha512-WDrybc/gKFpTYQutKIK6UvfcuxijIZfMfXaYm8NMsPQxSYvf+13fXUJ4rztGGbJcBQ/GF55gvrZ0Bc0bj/mqvg==",
++      "license": "MIT",
++      "peer": true,
++      "dependencies": {
++        "cheerio-select": "^2.1.0",
++        "dom-serializer": "^2.0.0",
++        "domhandler": "^5.0.3",
++        "domutils": "^3.2.2",
++        "encoding-sniffer": "^0.2.1",
++        "htmlparser2": "^10.1.0",
++        "parse5": "^7.3.0",
++        "parse5-htmlparser2-tree-adapter": "^7.1.0",
++        "parse5-parser-stream": "^7.1.2",
++        "undici": "^7.19.0",
++        "whatwg-mimetype": "^4.0.0"
++      },
++      "engines": {
++        "node": ">=20.18.1"
++      },
++      "funding": {
++        "url": "https://github.com/cheeriojs/cheerio?sponsor=1"
++      }
++    },
++    "node_modules/cheerio-select": {
++      "version": "2.1.0",
++      "resolved": "https://registry.npmjs.org/cheerio-select/-/cheerio-select-2.1.0.tgz",
++      "integrity": "sha512-9v9kG0LvzrlcungtnJtpGNxY+fzECQKhK4EGJX2vByejiMX84MFNQw4UxPJl3bFbTMw+Dfs37XaIkCwTZfLh4g==",
++      "license": "BSD-2-Clause",
++      "dependencies": {
++        "boolbase": "^1.0.0",
++        "css-select": "^5.1.0",
++        "css-what": "^6.1.0",
++        "domelementtype": "^2.3.0",
++        "domhandler": "^5.0.3",
++        "domutils": "^3.0.1"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/fb55"
++      }
++    },
++    "node_modules/cheerio/node_modules/undici": {
++      "version": "7.24.8",
++      "resolved": "https://registry.npmjs.org/undici/-/undici-7.24.8.tgz",
++      "integrity": "sha512-6KQ/+QxK49Z/p3HO6E5ZCZWNnCasyZLa5ExaVYyvPxUwKtbCPMKELJOqh7EqOle0t9cH/7d2TaaTRRa6Nhs4YQ==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=20.18.1"
++      }
++    },
+     "node_modules/chokidar": {
+       "version": "3.6.0",
+       "resolved": "https://registry.npmjs.org/chokidar/-/chokidar-3.6.0.tgz",
+@@ -3839,6 +4140,19 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/color": {
++      "version": "4.2.3",
++      "resolved": "https://registry.npmjs.org/color/-/color-4.2.3.tgz",
++      "integrity": "sha512-1rXeuUUiGGrykh+CeBdu5Ie7OJwinCgQY0bc7GCRxy5xVHy+moaqkpL/jqQq0MtQOeYcrqEz4abc5f0KtU7W4A==",
++      "license": "MIT",
++      "dependencies": {
++        "color-convert": "^2.0.1",
++        "color-string": "^1.9.0"
++      },
++      "engines": {
++        "node": ">=12.5.0"
++      }
++    },
+     "node_modules/color-convert": {
+       "version": "2.0.1",
+       "resolved": "https://registry.npmjs.org/color-convert/-/color-convert-2.0.1.tgz",
+@@ -3857,6 +4171,16 @@
+       "integrity": "sha512-dOy+3AuW3a2wNbZHIuMZpTcgjGuLU/uBL/ubcZF9OXbDo8ff4O8yVp5Bf0efS8uEoYo5q4Fx7dY9OgQGXgAsQA==",
+       "license": "MIT"
+     },
++    "node_modules/color-string": {
++      "version": "1.9.1",
++      "resolved": "https://registry.npmjs.org/color-string/-/color-string-1.9.1.tgz",
++      "integrity": "sha512-shrVawQFojnZv6xM40anx4CkoDP+fZsw/ZerEMsW/pyzsRbElpsL/DBVW7q3ExxwusdNXI3lXpuhEZkzs8p5Eg==",
++      "license": "MIT",
++      "dependencies": {
++        "color-name": "^1.0.0",
++        "simple-swizzle": "^0.2.2"
++      }
++    },
+     "node_modules/combined-stream": {
+       "version": "1.0.8",
+       "resolved": "https://registry.npmjs.org/combined-stream/-/combined-stream-1.0.8.tgz",
+@@ -4035,6 +4359,34 @@
+         "node": "*"
+       }
+     },
++    "node_modules/css-select": {
++      "version": "5.2.2",
++      "resolved": "https://registry.npmjs.org/css-select/-/css-select-5.2.2.tgz",
++      "integrity": "sha512-TizTzUddG/xYLA3NXodFM0fSbNizXjOKhqiQQwvhlspadZokn1KDy0NZFS0wuEubIYAV5/c1/lAr0TaaFXEXzw==",
++      "license": "BSD-2-Clause",
++      "dependencies": {
++        "boolbase": "^1.0.0",
++        "css-what": "^6.1.0",
++        "domhandler": "^5.0.2",
++        "domutils": "^3.0.1",
++        "nth-check": "^2.0.1"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/fb55"
++      }
++    },
++    "node_modules/css-what": {
++      "version": "6.2.2",
++      "resolved": "https://registry.npmjs.org/css-what/-/css-what-6.2.2.tgz",
++      "integrity": "sha512-u/O3vwbptzhMs3L1fQE82ZSLHQQfto5gyZzwteVIEyeaY5Fc7R4dapF/BvRoSYFeqfBk4m0V1Vafq5Pjv25wvA==",
++      "license": "BSD-2-Clause",
++      "engines": {
++        "node": ">= 6"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/fb55"
++      }
++    },
+     "node_modules/cssesc": {
+       "version": "3.0.0",
+       "resolved": "https://registry.npmjs.org/cssesc/-/cssesc-3.0.0.tgz",
+@@ -4082,6 +4434,30 @@
+         "node": ">=0.10.0"
+       }
+     },
++    "node_modules/decompress-response": {
++      "version": "6.0.0",
++      "resolved": "https://registry.npmjs.org/decompress-response/-/decompress-response-6.0.0.tgz",
++      "integrity": "sha512-aW35yZM6Bb/4oJlZncMH2LCoZtJXTRxES17vE3hoRiowU2kWHaJKFkSBDnDR+cm9J+9QhXmREyIfv0pji9ejCQ==",
++      "license": "MIT",
++      "dependencies": {
++        "mimic-response": "^3.1.0"
++      },
++      "engines": {
++        "node": ">=10"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/sindresorhus"
++      }
++    },
++    "node_modules/deep-extend": {
++      "version": "0.6.0",
++      "resolved": "https://registry.npmjs.org/deep-extend/-/deep-extend-0.6.0.tgz",
++      "integrity": "sha512-LOHxIOaPYdHlJRtCQfDIVZtfw/ufM8+rVj649RIHzcm/vGwQRXFt6OPqIFWsm2XEMrNIEtWR64sY1LEKD2vAOA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=4.0.0"
++      }
++    },
+     "node_modules/deep-is": {
+       "version": "0.1.4",
+       "resolved": "https://registry.npmjs.org/deep-is/-/deep-is-0.1.4.tgz",
+@@ -4121,7 +4497,6 @@
+       "version": "2.1.2",
+       "resolved": "https://registry.npmjs.org/detect-libc/-/detect-libc-2.1.2.tgz",
+       "integrity": "sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==",
+-      "dev": true,
+       "license": "Apache-2.0",
+       "engines": {
+         "node": ">=8"
+@@ -4157,6 +4532,61 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/dom-serializer": {
++      "version": "2.0.0",
++      "resolved": "https://registry.npmjs.org/dom-serializer/-/dom-serializer-2.0.0.tgz",
++      "integrity": "sha512-wIkAryiqt/nV5EQKqQpo3SToSOV9J0DnbJqwK7Wv/Trc92zIAYZ4FlMu+JPFW1DfGFt81ZTCGgDEabffXeLyJg==",
++      "license": "MIT",
++      "dependencies": {
++        "domelementtype": "^2.3.0",
++        "domhandler": "^5.0.2",
++        "entities": "^4.2.0"
++      },
++      "funding": {
++        "url": "https://github.com/cheeriojs/dom-serializer?sponsor=1"
++      }
++    },
++    "node_modules/domelementtype": {
++      "version": "2.3.0",
++      "resolved": "https://registry.npmjs.org/domelementtype/-/domelementtype-2.3.0.tgz",
++      "integrity": "sha512-OLETBj6w0OsagBwdXnPdN0cnMfF9opN69co+7ZrbfPGrdpPVNBUj02spi6B1N7wChLQiPn4CSH/zJvXw56gmHw==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fb55"
++        }
++      ],
++      "license": "BSD-2-Clause"
++    },
++    "node_modules/domhandler": {
++      "version": "5.0.3",
++      "resolved": "https://registry.npmjs.org/domhandler/-/domhandler-5.0.3.tgz",
++      "integrity": "sha512-cgwlv/1iFQiFnU96XXgROh8xTeetsnJiDsTc7TYCLFd9+/WNkIqPTxiM/8pSd8VIrhXGTf1Ny1q1hquVqDJB5w==",
++      "license": "BSD-2-Clause",
++      "dependencies": {
++        "domelementtype": "^2.3.0"
++      },
++      "engines": {
++        "node": ">= 4"
++      },
++      "funding": {
++        "url": "https://github.com/fb55/domhandler?sponsor=1"
++      }
++    },
++    "node_modules/domutils": {
++      "version": "3.2.2",
++      "resolved": "https://registry.npmjs.org/domutils/-/domutils-3.2.2.tgz",
++      "integrity": "sha512-6kZKyUajlDuqlHKVX1w7gyslj9MPIXzIFiz/rGu35uC1wMi+kMhQwGhl4lt9unC9Vb9INnY9Z3/ZA3+FhASLaw==",
++      "license": "BSD-2-Clause",
++      "dependencies": {
++        "dom-serializer": "^2.0.0",
++        "domelementtype": "^2.3.0",
++        "domhandler": "^5.0.3"
++      },
++      "funding": {
++        "url": "https://github.com/fb55/domutils?sponsor=1"
++      }
++    },
+     "node_modules/dotenv": {
+       "version": "17.4.1",
+       "resolved": "https://registry.npmjs.org/dotenv/-/dotenv-17.4.1.tgz",
+@@ -4261,14 +4691,48 @@
+         "node": ">= 0.8"
+       }
+     },
+-    "node_modules/entities": {
+-      "version": "4.5.0",
+-      "resolved": "https://registry.npmjs.org/entities/-/entities-4.5.0.tgz",
+-      "integrity": "sha512-V0hjH4dGPh9Ao5p0MoRY6BVqtwCjhz6vI5LT8AJ55H+4g9/4vbHx1I54fS0XuclLhDHArPQCiMjDxjaL8fPxhw==",
+-      "license": "BSD-2-Clause",
+-      "engines": {
+-        "node": ">=0.12"
+-      },
++    "node_modules/encoding-sniffer": {
++      "version": "0.2.1",
++      "resolved": "https://registry.npmjs.org/encoding-sniffer/-/encoding-sniffer-0.2.1.tgz",
++      "integrity": "sha512-5gvq20T6vfpekVtqrYQsSCFZ1wEg5+wW0/QaZMWkFr6BqD3NfKs0rLCx4rrVlSWJeZb5NBJgVLswK/w2MWU+Gw==",
++      "license": "MIT",
++      "dependencies": {
++        "iconv-lite": "^0.6.3",
++        "whatwg-encoding": "^3.1.1"
++      },
++      "funding": {
++        "url": "https://github.com/fb55/encoding-sniffer?sponsor=1"
++      }
++    },
++    "node_modules/encoding-sniffer/node_modules/iconv-lite": {
++      "version": "0.6.3",
++      "resolved": "https://registry.npmjs.org/iconv-lite/-/iconv-lite-0.6.3.tgz",
++      "integrity": "sha512-4fCk79wshMdzMp2rH06qWrJE4iolqLhCUH+OiuIgU++RB0+94NlDL81atO7GX55uUKueo0txHNtvEyI6D7WdMw==",
++      "license": "MIT",
++      "dependencies": {
++        "safer-buffer": ">= 2.1.2 < 3.0.0"
++      },
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/end-of-stream": {
++      "version": "1.4.5",
++      "resolved": "https://registry.npmjs.org/end-of-stream/-/end-of-stream-1.4.5.tgz",
++      "integrity": "sha512-ooEGc6HP26xXq/N+GCGOT0JKCLDGrq2bQUZrQ7gyrJiZANJ/8YDTxTpQBXGMn+WbIQXNVpyWymm7KYVICQnyOg==",
++      "license": "MIT",
++      "dependencies": {
++        "once": "^1.4.0"
++      }
++    },
++    "node_modules/entities": {
++      "version": "4.5.0",
++      "resolved": "https://registry.npmjs.org/entities/-/entities-4.5.0.tgz",
++      "integrity": "sha512-V0hjH4dGPh9Ao5p0MoRY6BVqtwCjhz6vI5LT8AJ55H+4g9/4vbHx1I54fS0XuclLhDHArPQCiMjDxjaL8fPxhw==",
++      "license": "BSD-2-Clause",
++      "engines": {
++        "node": ">=0.12"
++      },
+       "funding": {
+         "url": "https://github.com/fb55/entities?sponsor=1"
+       }
+@@ -4642,6 +5106,24 @@
+       "integrity": "sha512-8guHBZCwKnFhYdHr2ysuRWErTwhoN2X8XELRlrRwpmfeY2jjuUN4taQMsULKUVo1K4DvZl+0pgfyoysHxvmvEw==",
+       "license": "MIT"
+     },
++    "node_modules/events-universal": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/events-universal/-/events-universal-1.0.1.tgz",
++      "integrity": "sha512-LUd5euvbMLpwOF8m6ivPCbhQeSiYVNb8Vs0fQ8QjXo0JTkEHpz8pxdQf0gStltaPpw0Cca8b39KxvK9cfKRiAw==",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "bare-events": "^2.7.0"
++      }
++    },
++    "node_modules/expand-template": {
++      "version": "2.0.3",
++      "resolved": "https://registry.npmjs.org/expand-template/-/expand-template-2.0.3.tgz",
++      "integrity": "sha512-XYfuKMvj4O35f/pOXLObndIRvyQ+/+6AhODh+OKWj9S9498pHHn/IMszH+gt0fBCRWMNfk1ZSp5x3AifmnI2vg==",
++      "license": "(MIT OR WTFPL)",
++      "engines": {
++        "node": ">=6"
++      }
++    },
+     "node_modules/expr-eval": {
+       "version": "2.0.2",
+       "resolved": "https://registry.npmjs.org/expr-eval/-/expr-eval-2.0.2.tgz",
+@@ -4722,6 +5204,12 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/fast-fifo": {
++      "version": "1.3.2",
++      "resolved": "https://registry.npmjs.org/fast-fifo/-/fast-fifo-1.3.2.tgz",
++      "integrity": "sha512-/d9sfos4yxzpwkDkuN7k2SqFKtYNmCTzgfEpz82x34IM9/zc8KGxQoXg1liNC/izpRM/MBdt44Nmx41ZWqk+FQ==",
++      "license": "MIT"
++    },
+     "node_modules/fast-glob": {
+       "version": "3.3.3",
+       "resolved": "https://registry.npmjs.org/fast-glob/-/fast-glob-3.3.3.tgz",
+@@ -4900,6 +5388,12 @@
+         "node": ">=16"
+       }
+     },
++    "node_modules/flatbuffers": {
++      "version": "1.12.0",
++      "resolved": "https://registry.npmjs.org/flatbuffers/-/flatbuffers-1.12.0.tgz",
++      "integrity": "sha512-c7CZADjRcl6j0PlvFy0ZqXQ67qSEZfrVPynmnL+2zPc+NtMvrF8Y0QceMo7QqnSPc7+uWjUIAbvCQ5WIKlMVdQ==",
++      "license": "SEE LICENSE IN LICENSE.txt"
++    },
+     "node_modules/flatted": {
+       "version": "3.4.2",
+       "resolved": "https://registry.npmjs.org/flatted/-/flatted-3.4.2.tgz",
+@@ -5003,6 +5497,12 @@
+         "node": ">= 0.6"
+       }
+     },
++    "node_modules/fs-constants": {
++      "version": "1.0.0",
++      "resolved": "https://registry.npmjs.org/fs-constants/-/fs-constants-1.0.0.tgz",
++      "integrity": "sha512-y6OAwoSIf7FyjMIv94u+b5rdheZEjzR63GTyZJm5qh4Bi+2YgwLCcI/fPFZkL5PSixOt6ZNKm+w+Hfp/Bciwow==",
++      "license": "MIT"
++    },
+     "node_modules/fs-extra": {
+       "version": "11.1.1",
+       "resolved": "https://registry.npmjs.org/fs-extra/-/fs-extra-11.1.1.tgz",
+@@ -5099,6 +5599,13 @@
+         "node": ">= 0.4"
+       }
+     },
++    "node_modules/get-them-args": {
++      "version": "1.3.2",
++      "resolved": "https://registry.npmjs.org/get-them-args/-/get-them-args-1.3.2.tgz",
++      "integrity": "sha512-LRn8Jlk+DwZE4GTlDbT3Hikd1wSHgLMme/+7ddlqKd7ldwR6LjJgTVWzBnR01wnYGe4KgrXjg287RaI22UHmAw==",
++      "dev": true,
++      "license": "MIT"
++    },
+     "node_modules/get-tsconfig": {
+       "version": "4.13.7",
+       "resolved": "https://registry.npmjs.org/get-tsconfig/-/get-tsconfig-4.13.7.tgz",
+@@ -5112,6 +5619,12 @@
+         "url": "https://github.com/privatenumber/get-tsconfig?sponsor=1"
+       }
+     },
++    "node_modules/github-from-package": {
++      "version": "0.0.0",
++      "resolved": "https://registry.npmjs.org/github-from-package/-/github-from-package-0.0.0.tgz",
++      "integrity": "sha512-SyHy3T1v2NUXn29OsWdxmK6RwHD+vkj3v8en8AOBZ1wBQ/hCAQ5bAQTD02kW4W9tUp/3Qh6J8r9EvntiyCmOOw==",
++      "license": "MIT"
++    },
+     "node_modules/glob": {
+       "version": "13.0.6",
+       "resolved": "https://registry.npmjs.org/glob/-/glob-13.0.6.tgz",
+@@ -5221,6 +5734,12 @@
+       "dev": true,
+       "license": "ISC"
+     },
++    "node_modules/guid-typescript": {
++      "version": "1.0.9",
++      "resolved": "https://registry.npmjs.org/guid-typescript/-/guid-typescript-1.0.9.tgz",
++      "integrity": "sha512-Y8T4vYhEfwJOTbouREvG+3XDsjr8E3kIr7uf+JZ0BYloFsttiHU0WfvANVsR7TxNUJa/WpCnw/Ino/p+DeBhBQ==",
++      "license": "ISC"
++    },
+     "node_modules/has-flag": {
+       "version": "4.0.0",
+       "resolved": "https://registry.npmjs.org/has-flag/-/has-flag-4.0.0.tgz",
+@@ -5270,6 +5789,37 @@
+         "node": ">= 0.4"
+       }
+     },
++    "node_modules/htmlparser2": {
++      "version": "10.1.0",
++      "resolved": "https://registry.npmjs.org/htmlparser2/-/htmlparser2-10.1.0.tgz",
++      "integrity": "sha512-VTZkM9GWRAtEpveh7MSF6SjjrpNVNNVJfFup7xTY3UpFtm67foy9HDVXneLtFVt4pMz5kZtgNcvCniNFb1hlEQ==",
++      "funding": [
++        "https://github.com/fb55/htmlparser2?sponsor=1",
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fb55"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "domelementtype": "^2.3.0",
++        "domhandler": "^5.0.3",
++        "domutils": "^3.2.2",
++        "entities": "^7.0.1"
++      }
++    },
++    "node_modules/htmlparser2/node_modules/entities": {
++      "version": "7.0.1",
++      "resolved": "https://registry.npmjs.org/entities/-/entities-7.0.1.tgz",
++      "integrity": "sha512-TWrgLOFUQTH994YUyl1yT4uyavY5nNB5muff+RtWaqNVCAK408b5ZnnbNAUEWLTCpum9w6arT70i1XdQ4UeOPA==",
++      "license": "BSD-2-Clause",
++      "engines": {
++        "node": ">=0.12"
++      },
++      "funding": {
++        "url": "https://github.com/fb55/entities?sponsor=1"
++      }
++    },
+     "node_modules/http-errors": {
+       "version": "2.0.1",
+       "resolved": "https://registry.npmjs.org/http-errors/-/http-errors-2.0.1.tgz",
+@@ -5334,6 +5884,32 @@
+         "node": ">=0.10.0"
+       }
+     },
++    "node_modules/idb-keyval": {
++      "version": "6.2.2",
++      "resolved": "https://registry.npmjs.org/idb-keyval/-/idb-keyval-6.2.2.tgz",
++      "integrity": "sha512-yjD9nARJ/jb1g+CvD0tlhUHOrJ9Sy0P8T9MF3YaLlHnSRpwPfpTX0XIvpmw3gAJUmEu3FiICLBDPXVwyEvrleg==",
++      "license": "Apache-2.0"
++    },
++    "node_modules/ieee754": {
++      "version": "1.2.1",
++      "resolved": "https://registry.npmjs.org/ieee754/-/ieee754-1.2.1.tgz",
++      "integrity": "sha512-dcyqhDvX1C46lXZcVqCpK+FtMRQVdIMN6/Df5js2zouUsqG7I6sFxitIC+7KYK29KdXOLHdu9zL4sFnoVQnqaA==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/feross"
++        },
++        {
++          "type": "patreon",
++          "url": "https://www.patreon.com/feross"
++        },
++        {
++          "type": "consulting",
++          "url": "https://feross.org/support"
++        }
++      ],
++      "license": "BSD-3-Clause"
++    },
+     "node_modules/ignore": {
+       "version": "5.3.2",
+       "resolved": "https://registry.npmjs.org/ignore/-/ignore-5.3.2.tgz",
+@@ -5401,6 +5977,12 @@
+       "integrity": "sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ==",
+       "license": "ISC"
+     },
++    "node_modules/ini": {
++      "version": "1.3.8",
++      "resolved": "https://registry.npmjs.org/ini/-/ini-1.3.8.tgz",
++      "integrity": "sha512-JV/yugV2uzW5iMRSiZAyDtQd+nxtUnjeLt0acNdw98kKLrvuRVyB80tsREOE7yvGVgalhZ6RNXCmEHkUKBKxew==",
++      "license": "ISC"
++    },
+     "node_modules/ipaddr.js": {
+       "version": "1.9.1",
+       "resolved": "https://registry.npmjs.org/ipaddr.js/-/ipaddr.js-1.9.1.tgz",
+@@ -5416,6 +5998,12 @@
+       "integrity": "sha512-UtilS7hLRu++wb/WBAw9bNuP1Eg04Ivn1vERJck8zJthEvXCBEBpGR/33u/xLKWEQf95803oalHrVDptcAvFdQ==",
+       "license": "MIT"
+     },
++    "node_modules/is-arrayish": {
++      "version": "0.3.4",
++      "resolved": "https://registry.npmjs.org/is-arrayish/-/is-arrayish-0.3.4.tgz",
++      "integrity": "sha512-m6UrgzFVUYawGBh1dUsWR5M2Clqic9RVXC/9f8ceNlv2IcO9j9J/z8UoCLPqtsPBFNzEpfR3xftohbfqDx8EQA==",
++      "license": "MIT"
++    },
+     "node_modules/is-binary-path": {
+       "version": "2.1.0",
+       "resolved": "https://registry.npmjs.org/is-binary-path/-/is-binary-path-2.1.0.tgz",
+@@ -5493,6 +6081,12 @@
+         "node": ">=0.12.0"
+       }
+     },
++    "node_modules/is-url": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/is-url/-/is-url-1.2.4.tgz",
++      "integrity": "sha512-ITvGim8FhRiYe4IQ5uHSkj7pVaPDrCTkNd3yq3cV7iZAcJdHTUMPMEHcqSOy9xZ9qFenQCvi+2wjH9a1nXqHww==",
++      "license": "MIT"
++    },
+     "node_modules/isarray": {
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/isarray/-/isarray-1.0.0.tgz",
+@@ -5656,6 +6250,20 @@
+         "json-buffer": "3.0.1"
+       }
+     },
++    "node_modules/kill-port": {
++      "version": "2.0.1",
++      "resolved": "https://registry.npmjs.org/kill-port/-/kill-port-2.0.1.tgz",
++      "integrity": "sha512-e0SVOV5jFo0mx8r7bS29maVWp17qGqLBZ5ricNSajON6//kmb7qqqNnml4twNE8Dtj97UQD+gNFOaipS/q1zzQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "get-them-args": "1.3.2",
++        "shell-exec": "1.0.2"
++      },
++      "bin": {
++        "kill-port": "cli.js"
++      }
++    },
+     "node_modules/langchain": {
+       "version": "0.1.37",
+       "resolved": "https://registry.npmjs.org/langchain/-/langchain-0.1.37.tgz",
+@@ -6022,6 +6630,12 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/long": {
++      "version": "4.0.0",
++      "resolved": "https://registry.npmjs.org/long/-/long-4.0.0.tgz",
++      "integrity": "sha512-XsP+KhQif4bjX1kbuSiySJFNAehNxgLb6hPRGJ9QsUr8ajHkuXGdrHmFUTUUXhDwVX2R5bY4JNZEwbUiMhV+MA==",
++      "license": "Apache-2.0"
++    },
+     "node_modules/loose-envify": {
+       "version": "1.4.0",
+       "resolved": "https://registry.npmjs.org/loose-envify/-/loose-envify-1.4.0.tgz",
+@@ -6238,6 +6852,18 @@
+         "node": ">= 0.6"
+       }
+     },
++    "node_modules/mimic-response": {
++      "version": "3.1.0",
++      "resolved": "https://registry.npmjs.org/mimic-response/-/mimic-response-3.1.0.tgz",
++      "integrity": "sha512-z0yWI+4FDrrweS8Zmt4Ej5HdJmky15+L2e6Wgn3+iK5fWzb6T3fhNFq2+MeTRb064c6Wr4N/wv0DzQTjNzHNGQ==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=10"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/sindresorhus"
++      }
++    },
+     "node_modules/minimatch": {
+       "version": "10.1.1",
+       "resolved": "https://registry.npmjs.org/minimatch/-/minimatch-10.1.1.tgz",
+@@ -6298,6 +6924,12 @@
+         "mkdirp": "bin/cmd.js"
+       }
+     },
++    "node_modules/mkdirp-classic": {
++      "version": "0.5.3",
++      "resolved": "https://registry.npmjs.org/mkdirp-classic/-/mkdirp-classic-0.5.3.tgz",
++      "integrity": "sha512-gKLcREMhtuZRwRAfqP3RFW+TK4JqApVBtOIftVgjuABpAtpxhPGaDcfvbhNvD0B8iD1oUr/txX35NjcaY6Ns/A==",
++      "license": "MIT"
++    },
+     "node_modules/ml-array-mean": {
+       "version": "1.1.6",
+       "resolved": "https://registry.npmjs.org/ml-array-mean/-/ml-array-mean-1.1.6.tgz",
+@@ -6418,6 +7050,12 @@
+         "node": "^10 || ^12 || ^13.7 || ^14 || >=15.0.1"
+       }
+     },
++    "node_modules/napi-build-utils": {
++      "version": "2.0.0",
++      "resolved": "https://registry.npmjs.org/napi-build-utils/-/napi-build-utils-2.0.0.tgz",
++      "integrity": "sha512-GEbrYkbfF7MoNaoh2iGG84Mnf/WZfB0GdGEsM8wz7Expx/LlWf5U8t9nvJKXSp3qr5IsEbK04cBGhol/KwOsWA==",
++      "license": "MIT"
++    },
+     "node_modules/natural-compare": {
+       "version": "1.4.0",
+       "resolved": "https://registry.npmjs.org/natural-compare/-/natural-compare-1.4.0.tgz",
+@@ -6434,6 +7072,24 @@
+         "node": ">= 0.6"
+       }
+     },
++    "node_modules/node-abi": {
++      "version": "3.89.0",
++      "resolved": "https://registry.npmjs.org/node-abi/-/node-abi-3.89.0.tgz",
++      "integrity": "sha512-6u9UwL0HlAl21+agMN3YAMXcKByMqwGx+pq+P76vii5f7hTPtKDp08/H9py6DY+cfDw7kQNTGEj/rly3IgbNQA==",
++      "license": "MIT",
++      "dependencies": {
++        "semver": "^7.3.5"
++      },
++      "engines": {
++        "node": ">=10"
++      }
++    },
++    "node_modules/node-addon-api": {
++      "version": "6.1.0",
++      "resolved": "https://registry.npmjs.org/node-addon-api/-/node-addon-api-6.1.0.tgz",
++      "integrity": "sha512-+eawOlIgy680F0kBzPUNFhMZGtJ1YmqM6l4+Crf4IkImjYrO/mqPwRMh352g23uIaQKFItcQ64I7KMaJxHgAVA==",
++      "license": "MIT"
++    },
+     "node_modules/node-domexception": {
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/node-domexception/-/node-domexception-1.0.0.tgz",
+@@ -6616,6 +7272,18 @@
+         "node": ">=0.10.0"
+       }
+     },
++    "node_modules/nth-check": {
++      "version": "2.1.1",
++      "resolved": "https://registry.npmjs.org/nth-check/-/nth-check-2.1.1.tgz",
++      "integrity": "sha512-lqjrjmaOoAnWfMmBPL+XNnynZh2+swxiX3WUE0s4yEHI6m+AwrK2UZOimIRl3X/4QctVqS8AiZjFqyOGrMXb/w==",
++      "license": "BSD-2-Clause",
++      "dependencies": {
++        "boolbase": "^1.0.0"
++      },
++      "funding": {
++        "url": "https://github.com/fb55/nth-check?sponsor=1"
++      }
++    },
+     "node_modules/num-sort": {
+       "version": "2.1.0",
+       "resolved": "https://registry.npmjs.org/num-sort/-/num-sort-2.1.0.tgz",
+@@ -6671,6 +7339,59 @@
+         "node": ">= 0.8"
+       }
+     },
++    "node_modules/once": {
++      "version": "1.4.0",
++      "resolved": "https://registry.npmjs.org/once/-/once-1.4.0.tgz",
++      "integrity": "sha512-lNaJgI+2Q5URQBkccEKHTQOPaXdUxnZZElQTZY0MFUAuaEqe1E+Nyvgdz/aIyNi6Z9MzO5dv1H8n58/GELp3+w==",
++      "license": "ISC",
++      "dependencies": {
++        "wrappy": "1"
++      }
++    },
++    "node_modules/onnx-proto": {
++      "version": "4.0.4",
++      "resolved": "https://registry.npmjs.org/onnx-proto/-/onnx-proto-4.0.4.tgz",
++      "integrity": "sha512-aldMOB3HRoo6q/phyB6QRQxSt895HNNw82BNyZ2CMh4bjeKv7g/c+VpAFtJuEMVfYLMbRx61hbuqnKceLeDcDA==",
++      "license": "MIT",
++      "dependencies": {
++        "protobufjs": "^6.8.8"
++      }
++    },
++    "node_modules/onnxruntime-common": {
++      "version": "1.14.0",
++      "resolved": "https://registry.npmjs.org/onnxruntime-common/-/onnxruntime-common-1.14.0.tgz",
++      "integrity": "sha512-3LJpegM2iMNRX2wUmtYfeX/ytfOzNwAWKSq1HbRrKc9+uqG/FsEA0bbKZl1btQeZaXhC26l44NWpNUeXPII7Ew==",
++      "license": "MIT"
++    },
++    "node_modules/onnxruntime-node": {
++      "version": "1.14.0",
++      "resolved": "https://registry.npmjs.org/onnxruntime-node/-/onnxruntime-node-1.14.0.tgz",
++      "integrity": "sha512-5ba7TWomIV/9b6NH/1x/8QEeowsb+jBEvFzU6z0T4mNsFwdPqXeFUM7uxC6QeSRkEbWu3qEB0VMjrvzN/0S9+w==",
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32",
++        "darwin",
++        "linux"
++      ],
++      "dependencies": {
++        "onnxruntime-common": "~1.14.0"
++      }
++    },
++    "node_modules/onnxruntime-web": {
++      "version": "1.14.0",
++      "resolved": "https://registry.npmjs.org/onnxruntime-web/-/onnxruntime-web-1.14.0.tgz",
++      "integrity": "sha512-Kcqf43UMfW8mCydVGcX9OMXI2VN17c0p6XvR7IPSZzBf/6lteBzXHvcEVWDPmCKuGombl997HgLqj91F11DzXw==",
++      "license": "MIT",
++      "dependencies": {
++        "flatbuffers": "^1.12.0",
++        "guid-typescript": "^1.0.9",
++        "long": "^4.0.0",
++        "onnx-proto": "^4.0.4",
++        "onnxruntime-common": "~1.14.0",
++        "platform": "^1.3.6"
++      }
++    },
+     "node_modules/openai": {
+       "version": "4.104.0",
+       "resolved": "https://registry.npmjs.org/openai/-/openai-4.104.0.tgz",
+@@ -6723,6 +7444,15 @@
+       "integrity": "sha512-N4YtSYJqghVu4iek2ZUvcN/0aqH1kRDuNqzcycDxhOUpg7GdvLa2F3DgS6yBNhInhv2r/6I0Flkn7CqL8+nIcw==",
+       "license": "MIT"
+     },
++    "node_modules/opencollective-postinstall": {
++      "version": "2.0.3",
++      "resolved": "https://registry.npmjs.org/opencollective-postinstall/-/opencollective-postinstall-2.0.3.tgz",
++      "integrity": "sha512-8AV/sCtuzUeTo8gQK5qDZzARrulB3egtLzFgteqB2tcT4Mw7B8Kt7JcDHmltjz6FOAHsvTevk70gZEbhM4ZS9Q==",
++      "license": "MIT",
++      "bin": {
++        "opencollective-postinstall": "index.js"
++      }
++    },
+     "node_modules/option": {
+       "version": "0.2.4",
+       "resolved": "https://registry.npmjs.org/option/-/option-0.2.4.tgz",
+@@ -6858,6 +7588,55 @@
+         "node": ">=6"
+       }
+     },
++    "node_modules/parse5": {
++      "version": "7.3.0",
++      "resolved": "https://registry.npmjs.org/parse5/-/parse5-7.3.0.tgz",
++      "integrity": "sha512-IInvU7fabl34qmi9gY8XOVxhYyMyuH2xUNpb2q8/Y+7552KlejkRvqvD19nMoUW/uQGGbqNpA6Tufu5FL5BZgw==",
++      "license": "MIT",
++      "dependencies": {
++        "entities": "^6.0.0"
++      },
++      "funding": {
++        "url": "https://github.com/inikulin/parse5?sponsor=1"
++      }
++    },
++    "node_modules/parse5-htmlparser2-tree-adapter": {
++      "version": "7.1.0",
++      "resolved": "https://registry.npmjs.org/parse5-htmlparser2-tree-adapter/-/parse5-htmlparser2-tree-adapter-7.1.0.tgz",
++      "integrity": "sha512-ruw5xyKs6lrpo9x9rCZqZZnIUntICjQAd0Wsmp396Ul9lN/h+ifgVV1x1gZHi8euej6wTfpqX8j+BFQxF0NS/g==",
++      "license": "MIT",
++      "dependencies": {
++        "domhandler": "^5.0.3",
++        "parse5": "^7.0.0"
++      },
++      "funding": {
++        "url": "https://github.com/inikulin/parse5?sponsor=1"
++      }
++    },
++    "node_modules/parse5-parser-stream": {
++      "version": "7.1.2",
++      "resolved": "https://registry.npmjs.org/parse5-parser-stream/-/parse5-parser-stream-7.1.2.tgz",
++      "integrity": "sha512-JyeQc9iwFLn5TbvvqACIF/VXG6abODeB3Fwmv/TGdLk2LfbWkaySGY72at4+Ty7EkPZj854u4CrICqNk2qIbow==",
++      "license": "MIT",
++      "dependencies": {
++        "parse5": "^7.0.0"
++      },
++      "funding": {
++        "url": "https://github.com/inikulin/parse5?sponsor=1"
++      }
++    },
++    "node_modules/parse5/node_modules/entities": {
++      "version": "6.0.1",
++      "resolved": "https://registry.npmjs.org/entities/-/entities-6.0.1.tgz",
++      "integrity": "sha512-aN97NXWF6AWBTahfVOIrB/NShkzi5H7F9r1s9mD3cDj4Ko5f2qhhVoYMibXF7GlLveb/D2ioWay8lxI97Ven3g==",
++      "license": "BSD-2-Clause",
++      "engines": {
++        "node": ">=0.12"
++      },
++      "funding": {
++        "url": "https://github.com/fb55/entities?sponsor=1"
++      }
++    },
+     "node_modules/parseurl": {
+       "version": "1.3.3",
+       "resolved": "https://registry.npmjs.org/parseurl/-/parseurl-1.3.3.tgz",
+@@ -7015,6 +7794,12 @@
+         "node": ">= 6"
+       }
+     },
++    "node_modules/platform": {
++      "version": "1.3.6",
++      "resolved": "https://registry.npmjs.org/platform/-/platform-1.3.6.tgz",
++      "integrity": "sha512-fnWVljUchTro6RiCFvCXBbNhJc2NijN7oIQxbwsyL0buWJPG85v81ehlHI9fXrJsMNgTofEoWIQeClKpgxFLrg==",
++      "license": "MIT"
++    },
+     "node_modules/postcss": {
+       "version": "8.5.9",
+       "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.9.tgz",
+@@ -7179,6 +7964,81 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/prebuild-install": {
++      "version": "7.1.3",
++      "resolved": "https://registry.npmjs.org/prebuild-install/-/prebuild-install-7.1.3.tgz",
++      "integrity": "sha512-8Mf2cbV7x1cXPUILADGI3wuhfqWvtiLA1iclTDbFRZkgRQS0NqsPZphna9V+HyTEadheuPmjaJMsbzKQFOzLug==",
++      "deprecated": "No longer maintained. Please contact the author of the relevant native addon; alternatives are available.",
++      "license": "MIT",
++      "dependencies": {
++        "detect-libc": "^2.0.0",
++        "expand-template": "^2.0.3",
++        "github-from-package": "0.0.0",
++        "minimist": "^1.2.3",
++        "mkdirp-classic": "^0.5.3",
++        "napi-build-utils": "^2.0.0",
++        "node-abi": "^3.3.0",
++        "pump": "^3.0.0",
++        "rc": "^1.2.7",
++        "simple-get": "^4.0.0",
++        "tar-fs": "^2.0.0",
++        "tunnel-agent": "^0.6.0"
++      },
++      "bin": {
++        "prebuild-install": "bin.js"
++      },
++      "engines": {
++        "node": ">=10"
++      }
++    },
++    "node_modules/prebuild-install/node_modules/chownr": {
++      "version": "1.1.4",
++      "resolved": "https://registry.npmjs.org/chownr/-/chownr-1.1.4.tgz",
++      "integrity": "sha512-jJ0bqzaylmJtVnNgzTeSOs8DPavpbYgEr/b0YL8/2GO3xJEhInFmhKMUnEJQjZumK7KXGFhUy89PrsJWlakBVg==",
++      "license": "ISC"
++    },
++    "node_modules/prebuild-install/node_modules/readable-stream": {
++      "version": "3.6.2",
++      "resolved": "https://registry.npmjs.org/readable-stream/-/readable-stream-3.6.2.tgz",
++      "integrity": "sha512-9u/sniCrY3D5WdsERHzHE4G2YCXqoG5FTHUiCC4SIbr6XcLZBY05ya9EKjYek9O5xOAwjGq+1JdGBAS7Q9ScoA==",
++      "license": "MIT",
++      "dependencies": {
++        "inherits": "^2.0.3",
++        "string_decoder": "^1.1.1",
++        "util-deprecate": "^1.0.1"
++      },
++      "engines": {
++        "node": ">= 6"
++      }
++    },
++    "node_modules/prebuild-install/node_modules/tar-fs": {
++      "version": "2.1.4",
++      "resolved": "https://registry.npmjs.org/tar-fs/-/tar-fs-2.1.4.tgz",
++      "integrity": "sha512-mDAjwmZdh7LTT6pNleZ05Yt65HC3E+NiQzl672vQG38jIrehtJk/J3mNwIg+vShQPcLF/LV7CMnDW6vjj6sfYQ==",
++      "license": "MIT",
++      "dependencies": {
++        "chownr": "^1.1.1",
++        "mkdirp-classic": "^0.5.2",
++        "pump": "^3.0.0",
++        "tar-stream": "^2.1.4"
++      }
++    },
++    "node_modules/prebuild-install/node_modules/tar-stream": {
++      "version": "2.2.0",
++      "resolved": "https://registry.npmjs.org/tar-stream/-/tar-stream-2.2.0.tgz",
++      "integrity": "sha512-ujeqbceABgwMZxEJnk2HDY2DlnUZ+9oEcb1KzTVfYHio0UE6dG71n60d8D2I4qNvleWrrXpmjpt7vZeF1LnMZQ==",
++      "license": "MIT",
++      "dependencies": {
++        "bl": "^4.0.3",
++        "end-of-stream": "^1.4.1",
++        "fs-constants": "^1.0.0",
++        "inherits": "^2.0.3",
++        "readable-stream": "^3.1.1"
++      },
++      "engines": {
++        "node": ">=6"
++      }
++    },
+     "node_modules/prelude-ls": {
+       "version": "1.2.1",
+       "resolved": "https://registry.npmjs.org/prelude-ls/-/prelude-ls-1.2.1.tgz",
+@@ -7211,6 +8071,32 @@
+       "integrity": "sha512-3ouUOpQhtgrbOa17J7+uxOTpITYWaGP7/AhoR3+A+/1e9skrzelGi/dXzEYyvbxubEF6Wn2ypscTKiKJFFn1ag==",
+       "license": "MIT"
+     },
++    "node_modules/protobufjs": {
++      "version": "6.11.4",
++      "resolved": "https://registry.npmjs.org/protobufjs/-/protobufjs-6.11.4.tgz",
++      "integrity": "sha512-5kQWPaJHi1WoCpjTGszzQ32PG2F4+wRY6BmAT4Vfw56Q2FZ4YZzK20xUYQH4YkfehY1e6QSICrJquM6xXZNcrw==",
++      "hasInstallScript": true,
++      "license": "BSD-3-Clause",
++      "dependencies": {
++        "@protobufjs/aspromise": "^1.1.2",
++        "@protobufjs/base64": "^1.1.2",
++        "@protobufjs/codegen": "^2.0.4",
++        "@protobufjs/eventemitter": "^1.1.0",
++        "@protobufjs/fetch": "^1.1.0",
++        "@protobufjs/float": "^1.0.2",
++        "@protobufjs/inquire": "^1.1.0",
++        "@protobufjs/path": "^1.1.2",
++        "@protobufjs/pool": "^1.1.0",
++        "@protobufjs/utf8": "^1.1.0",
++        "@types/long": "^4.0.1",
++        "@types/node": ">=13.7.0",
++        "long": "^4.0.0"
++      },
++      "bin": {
++        "pbjs": "bin/pbjs",
++        "pbts": "bin/pbts"
++      }
++    },
+     "node_modules/proxy-addr": {
+       "version": "2.0.7",
+       "resolved": "https://registry.npmjs.org/proxy-addr/-/proxy-addr-2.0.7.tgz",
+@@ -7240,6 +8126,16 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/pump": {
++      "version": "3.0.4",
++      "resolved": "https://registry.npmjs.org/pump/-/pump-3.0.4.tgz",
++      "integrity": "sha512-VS7sjc6KR7e1ukRFhQSY5LM2uBWAUPiOPa/A3mkKmiMwSmRFUITt0xuj+/lesgnCv+dPIEYlkzrcyXgquIHMcA==",
++      "license": "MIT",
++      "dependencies": {
++        "end-of-stream": "^1.1.0",
++        "once": "^1.3.1"
++      }
++    },
+     "node_modules/punycode": {
+       "version": "2.3.1",
+       "resolved": "https://registry.npmjs.org/punycode/-/punycode-2.3.1.tgz",
+@@ -7319,6 +8215,30 @@
+         "node": ">= 0.8"
+       }
+     },
++    "node_modules/rc": {
++      "version": "1.2.8",
++      "resolved": "https://registry.npmjs.org/rc/-/rc-1.2.8.tgz",
++      "integrity": "sha512-y3bGgqKj3QBdxLbLkomlohkvsA8gdAiUQlSBJnBhfn+BPxg4bc62d8TcBW15wavDfgexCgccckhcZvywyQYPOw==",
++      "license": "(BSD-2-Clause OR MIT OR Apache-2.0)",
++      "dependencies": {
++        "deep-extend": "^0.6.0",
++        "ini": "~1.3.0",
++        "minimist": "^1.2.0",
++        "strip-json-comments": "~2.0.1"
++      },
++      "bin": {
++        "rc": "cli.js"
++      }
++    },
++    "node_modules/rc/node_modules/strip-json-comments": {
++      "version": "2.0.1",
++      "resolved": "https://registry.npmjs.org/strip-json-comments/-/strip-json-comments-2.0.1.tgz",
++      "integrity": "sha512-4gB8na07fecVVkOI6Rs4e7T6NOTki5EmL7TUduTs6bu3EdnSycntVJ4re8kgZA+wx9IueI2Y11bfbgwtzuE0KQ==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
+     "node_modules/react": {
+       "version": "18.3.1",
+       "resolved": "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
+@@ -7464,6 +8384,12 @@
+         "url": "https://github.com/sponsors/jonschlinkert"
+       }
+     },
++    "node_modules/regenerator-runtime": {
++      "version": "0.13.11",
++      "resolved": "https://registry.npmjs.org/regenerator-runtime/-/regenerator-runtime-0.13.11.tgz",
++      "integrity": "sha512-kY1AZVr2Ra+t+piVaJ4gxaFaReZVH40AKNo7UCX6W+dEwBo/2oZJzqfuN1qLq1oL45o56cPaTXELwrTh8Fpggg==",
++      "license": "MIT"
++    },
+     "node_modules/require-directory": {
+       "version": "2.1.1",
+       "resolved": "https://registry.npmjs.org/require-directory/-/require-directory-2.1.1.tgz",
+@@ -7744,6 +8670,29 @@
+       "integrity": "sha512-E5LDX7Wrp85Kil5bhZv46j8jOeboKq5JMmYM3gVGdGH8xFpPWXUMsNrlODCrkoxMEeNi/XZIwuRvY4XNwYMJpw==",
+       "license": "ISC"
+     },
++    "node_modules/sharp": {
++      "version": "0.32.6",
++      "resolved": "https://registry.npmjs.org/sharp/-/sharp-0.32.6.tgz",
++      "integrity": "sha512-KyLTWwgcR9Oe4d9HwCwNM2l7+J0dUQwn/yf7S0EnTtb0eVS4RxO0eUSvxPtzT4F3SY+C4K6fqdv/DO27sJ/v/w==",
++      "hasInstallScript": true,
++      "license": "Apache-2.0",
++      "dependencies": {
++        "color": "^4.2.3",
++        "detect-libc": "^2.0.2",
++        "node-addon-api": "^6.1.0",
++        "prebuild-install": "^7.1.1",
++        "semver": "^7.5.4",
++        "simple-get": "^4.0.1",
++        "tar-fs": "^3.0.4",
++        "tunnel-agent": "^0.6.0"
++      },
++      "engines": {
++        "node": ">=14.15.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/libvips"
++      }
++    },
+     "node_modules/shebang-command": {
+       "version": "2.0.0",
+       "resolved": "https://registry.npmjs.org/shebang-command/-/shebang-command-2.0.0.tgz",
+@@ -7767,6 +8716,13 @@
+         "node": ">=8"
+       }
+     },
++    "node_modules/shell-exec": {
++      "version": "1.0.2",
++      "resolved": "https://registry.npmjs.org/shell-exec/-/shell-exec-1.0.2.tgz",
++      "integrity": "sha512-jyVd+kU2X+mWKMmGhx4fpWbPsjvD53k9ivqetutVW/BQ+WIZoDoP4d8vUMGezV6saZsiNoW2f9GIhg9Dondohg==",
++      "dev": true,
++      "license": "MIT"
++    },
+     "node_modules/shell-quote": {
+       "version": "1.8.3",
+       "resolved": "https://registry.npmjs.org/shell-quote/-/shell-quote-1.8.3.tgz",
+@@ -7865,6 +8821,60 @@
+         "url": "https://github.com/sponsors/isaacs"
+       }
+     },
++    "node_modules/simple-concat": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/simple-concat/-/simple-concat-1.0.1.tgz",
++      "integrity": "sha512-cSFtAPtRhljv69IK0hTVZQ+OfE9nePi/rtJmw5UjHeVyVroEqJXP1sFztKUy1qU+xvz3u/sfYJLa947b7nAN2Q==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/feross"
++        },
++        {
++          "type": "patreon",
++          "url": "https://www.patreon.com/feross"
++        },
++        {
++          "type": "consulting",
++          "url": "https://feross.org/support"
++        }
++      ],
++      "license": "MIT"
++    },
++    "node_modules/simple-get": {
++      "version": "4.0.1",
++      "resolved": "https://registry.npmjs.org/simple-get/-/simple-get-4.0.1.tgz",
++      "integrity": "sha512-brv7p5WgH0jmQJr1ZDDfKDOSeWWg+OVypG99A/5vYGPqJ6pxiaHLy8nxtFjBA7oMa01ebA9gfh1uMCFqOuXxvA==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/feross"
++        },
++        {
++          "type": "patreon",
++          "url": "https://www.patreon.com/feross"
++        },
++        {
++          "type": "consulting",
++          "url": "https://feross.org/support"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "decompress-response": "^6.0.0",
++        "once": "^1.3.1",
++        "simple-concat": "^1.0.0"
++      }
++    },
++    "node_modules/simple-swizzle": {
++      "version": "0.2.4",
++      "resolved": "https://registry.npmjs.org/simple-swizzle/-/simple-swizzle-0.2.4.tgz",
++      "integrity": "sha512-nAu1WFPQSMNr2Zn9PGSZK9AGn4t/y97lEm+MXTtUDwfP0ksAIX4nO+6ruD9Jwut4C49SB1Ws+fbXsm/yScWOHw==",
++      "license": "MIT",
++      "dependencies": {
++        "is-arrayish": "^0.3.1"
++      }
++    },
+     "node_modules/simple-update-notifier": {
+       "version": "2.0.0",
+       "resolved": "https://registry.npmjs.org/simple-update-notifier/-/simple-update-notifier-2.0.0.tgz",
+@@ -7924,6 +8934,17 @@
+         "node": ">=10.0.0"
+       }
+     },
++    "node_modules/streamx": {
++      "version": "2.25.0",
++      "resolved": "https://registry.npmjs.org/streamx/-/streamx-2.25.0.tgz",
++      "integrity": "sha512-0nQuG6jf1w+wddNEEXCF4nTg3LtufWINB5eFEN+5TNZW7KWJp6x87+JFL43vaAUPyCfH1wID+mNVyW6OHtFamg==",
++      "license": "MIT",
++      "dependencies": {
++        "events-universal": "^1.0.0",
++        "fast-fifo": "^1.3.2",
++        "text-decoder": "^1.1.0"
++      }
++    },
+     "node_modules/string_decoder": {
+       "version": "1.1.1",
+       "resolved": "https://registry.npmjs.org/string_decoder/-/string_decoder-1.1.1.tgz",
+@@ -8105,6 +9126,46 @@
+         "node": ">=18"
+       }
+     },
++    "node_modules/tar-fs": {
++      "version": "3.1.2",
++      "resolved": "https://registry.npmjs.org/tar-fs/-/tar-fs-3.1.2.tgz",
++      "integrity": "sha512-QGxxTxxyleAdyM3kpFs14ymbYmNFrfY+pHj7Z8FgtbZ7w2//VAgLMac7sT6nRpIHjppXO2AwwEOg0bPFVRcmXw==",
++      "license": "MIT",
++      "dependencies": {
++        "pump": "^3.0.0",
++        "tar-stream": "^3.1.5"
++      },
++      "optionalDependencies": {
++        "bare-fs": "^4.0.1",
++        "bare-path": "^3.0.0"
++      }
++    },
++    "node_modules/tar-stream": {
++      "version": "3.1.8",
++      "resolved": "https://registry.npmjs.org/tar-stream/-/tar-stream-3.1.8.tgz",
++      "integrity": "sha512-U6QpVRyCGHva435KoNWy9PRoi2IFYCgtEhq9nmrPPpbRacPs9IH4aJ3gbrFC8dPcXvdSZ4XXfXT5Fshbp2MtlQ==",
++      "license": "MIT",
++      "dependencies": {
++        "b4a": "^1.6.4",
++        "bare-fs": "^4.5.5",
++        "fast-fifo": "^1.2.0",
++        "streamx": "^2.15.0"
++      }
++    },
++    "node_modules/tar-stream/node_modules/b4a": {
++      "version": "1.8.0",
++      "resolved": "https://registry.npmjs.org/b4a/-/b4a-1.8.0.tgz",
++      "integrity": "sha512-qRuSmNSkGQaHwNbM7J78Wwy+ghLEYF1zNrSeMxj4Kgw6y33O3mXcQ6Ie9fRvfU/YnxWkOchPXbaLb73TkIsfdg==",
++      "license": "Apache-2.0",
++      "peerDependencies": {
++        "react-native-b4a": "*"
++      },
++      "peerDependenciesMeta": {
++        "react-native-b4a": {
++          "optional": true
++        }
++      }
++    },
+     "node_modules/tar/node_modules/yallist": {
+       "version": "5.0.0",
+       "resolved": "https://registry.npmjs.org/yallist/-/yallist-5.0.0.tgz",
+@@ -8115,6 +9176,62 @@
+         "node": ">=18"
+       }
+     },
++    "node_modules/teex": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/teex/-/teex-1.0.1.tgz",
++      "integrity": "sha512-eYE6iEI62Ni1H8oIa7KlDU6uQBtqr4Eajni3wX7rpfXD8ysFx8z0+dri+KWEPWpBsxXfxu58x/0jvTVT1ekOSg==",
++      "license": "MIT",
++      "dependencies": {
++        "streamx": "^2.12.5"
++      }
++    },
++    "node_modules/tesseract.js": {
++      "version": "7.0.0",
++      "resolved": "https://registry.npmjs.org/tesseract.js/-/tesseract.js-7.0.0.tgz",
++      "integrity": "sha512-exPBkd+z+wM1BuMkx/Bjv43OeLBxhL5kKWsz/9JY+DXcXdiBjiAch0V49QR3oAJqCaL5qURE0vx9Eo+G5YE7mA==",
++      "hasInstallScript": true,
++      "license": "Apache-2.0",
++      "dependencies": {
++        "bmp-js": "^0.1.0",
++        "idb-keyval": "^6.2.0",
++        "is-url": "^1.2.4",
++        "node-fetch": "^2.6.9",
++        "opencollective-postinstall": "^2.0.3",
++        "regenerator-runtime": "^0.13.3",
++        "tesseract.js-core": "^7.0.0",
++        "wasm-feature-detect": "^1.8.0",
++        "zlibjs": "^0.3.1"
++      }
++    },
++    "node_modules/tesseract.js-core": {
++      "version": "7.0.0",
++      "resolved": "https://registry.npmjs.org/tesseract.js-core/-/tesseract.js-core-7.0.0.tgz",
++      "integrity": "sha512-WnNH518NzmbSq9zgTPeoF8c+xmilS8rFIl1YKbk/ptuuc7p6cLNELNuPAzcmsYw450ca6bLa8j3t0VAtq435Vw==",
++      "license": "Apache-2.0"
++    },
++    "node_modules/text-decoder": {
++      "version": "1.2.7",
++      "resolved": "https://registry.npmjs.org/text-decoder/-/text-decoder-1.2.7.tgz",
++      "integrity": "sha512-vlLytXkeP4xvEq2otHeJfSQIRyWxo/oZGEbXrtEEF9Hnmrdly59sUbzZ/QgyWuLYHctCHxFF4tRQZNQ9k60ExQ==",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "b4a": "^1.6.4"
++      }
++    },
++    "node_modules/text-decoder/node_modules/b4a": {
++      "version": "1.8.0",
++      "resolved": "https://registry.npmjs.org/b4a/-/b4a-1.8.0.tgz",
++      "integrity": "sha512-qRuSmNSkGQaHwNbM7J78Wwy+ghLEYF1zNrSeMxj4Kgw6y33O3mXcQ6Ie9fRvfU/YnxWkOchPXbaLb73TkIsfdg==",
++      "license": "Apache-2.0",
++      "peerDependencies": {
++        "react-native-b4a": "*"
++      },
++      "peerDependenciesMeta": {
++        "react-native-b4a": {
++          "optional": true
++        }
++      }
++    },
+     "node_modules/thenify": {
+       "version": "3.3.1",
+       "resolved": "https://registry.npmjs.org/thenify/-/thenify-3.3.1.tgz",
+@@ -8304,6 +9421,18 @@
+         "fsevents": "~2.3.3"
+       }
+     },
++    "node_modules/tunnel-agent": {
++      "version": "0.6.0",
++      "resolved": "https://registry.npmjs.org/tunnel-agent/-/tunnel-agent-0.6.0.tgz",
++      "integrity": "sha512-McnNiV1l8RYeY8tBgEpuodCC1mLUdbSN+CYBL7kJsJNInOP8UjDDEwdk6Mw60vdLLrr5NHKZhMAOSrR2NZuQ+w==",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "safe-buffer": "^5.0.1"
++      },
++      "engines": {
++        "node": "*"
++      }
++    },
+     "node_modules/type-check": {
+       "version": "0.4.0",
+       "resolved": "https://registry.npmjs.org/type-check/-/type-check-0.4.0.tgz",
+@@ -9103,6 +10232,12 @@
+         "@esbuild/win32-x64": "0.25.12"
+       }
+     },
++    "node_modules/wasm-feature-detect": {
++      "version": "1.8.0",
++      "resolved": "https://registry.npmjs.org/wasm-feature-detect/-/wasm-feature-detect-1.8.0.tgz",
++      "integrity": "sha512-zksaLKM2fVlnB5jQQDqKXXwYHLQUVH9es+5TOOHwGOVJOCeRBCiPjwSg+3tN2AdTCzjgli4jijCH290kXb/zWQ==",
++      "license": "Apache-2.0"
++    },
+     "node_modules/web-streams-polyfill": {
+       "version": "3.3.3",
+       "resolved": "https://registry.npmjs.org/web-streams-polyfill/-/web-streams-polyfill-3.3.3.tgz",
+@@ -9118,12 +10253,46 @@
+       "integrity": "sha512-2JAn3z8AR6rjK8Sm8orRC0h/bcl/DqL7tRPdGZ4I1CjdF+EaMLmYxBHyXuKL849eucPFhvBoxMsflfOb8kxaeQ==",
+       "license": "BSD-2-Clause"
+     },
++    "node_modules/whatwg-encoding": {
++      "version": "3.1.1",
++      "resolved": "https://registry.npmjs.org/whatwg-encoding/-/whatwg-encoding-3.1.1.tgz",
++      "integrity": "sha512-6qN4hJdMwfYBtE3YBTTHhoeuUrDBPZmbQaxWAqSALV/MeEnR5z1xd8UKud2RAkFoPkmB+hli1TZSnyi84xz1vQ==",
++      "deprecated": "Use @exodus/bytes instead for a more spec-conformant and faster implementation",
++      "license": "MIT",
++      "dependencies": {
++        "iconv-lite": "0.6.3"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/whatwg-encoding/node_modules/iconv-lite": {
++      "version": "0.6.3",
++      "resolved": "https://registry.npmjs.org/iconv-lite/-/iconv-lite-0.6.3.tgz",
++      "integrity": "sha512-4fCk79wshMdzMp2rH06qWrJE4iolqLhCUH+OiuIgU++RB0+94NlDL81atO7GX55uUKueo0txHNtvEyI6D7WdMw==",
++      "license": "MIT",
++      "dependencies": {
++        "safer-buffer": ">= 2.1.2 < 3.0.0"
++      },
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
+     "node_modules/whatwg-fetch": {
+       "version": "3.6.20",
+       "resolved": "https://registry.npmjs.org/whatwg-fetch/-/whatwg-fetch-3.6.20.tgz",
+       "integrity": "sha512-EqhiFU6daOA8kpjOWTL0olhVOF3i7OrFzSYiGsEMB8GcXS+RrzauAERX65xMeNWVqxA6HXH2m69Z9LaKKdisfg==",
+       "license": "MIT"
+     },
++    "node_modules/whatwg-mimetype": {
++      "version": "4.0.0",
++      "resolved": "https://registry.npmjs.org/whatwg-mimetype/-/whatwg-mimetype-4.0.0.tgz",
++      "integrity": "sha512-QaKxh0eNIi2mE9p2vEdzfagOKHCcj1pJ56EEHGQOVxp8r9/iszLUUV7v89x9O1p/T+NlTM5W7jW6+cz4Fq1YVg==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      }
++    },
+     "node_modules/whatwg-url": {
+       "version": "5.0.0",
+       "resolved": "https://registry.npmjs.org/whatwg-url/-/whatwg-url-5.0.0.tgz",
+@@ -9192,6 +10361,12 @@
+         "url": "https://github.com/chalk/ansi-styles?sponsor=1"
+       }
+     },
++    "node_modules/wrappy": {
++      "version": "1.0.2",
++      "resolved": "https://registry.npmjs.org/wrappy/-/wrappy-1.0.2.tgz",
++      "integrity": "sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ==",
++      "license": "ISC"
++    },
+     "node_modules/ws": {
+       "version": "8.20.0",
+       "resolved": "https://registry.npmjs.org/ws/-/ws-8.20.0.tgz",
+@@ -9305,6 +10480,15 @@
+         "url": "https://github.com/sponsors/sindresorhus"
+       }
+     },
++    "node_modules/zlibjs": {
++      "version": "0.3.1",
++      "resolved": "https://registry.npmjs.org/zlibjs/-/zlibjs-0.3.1.tgz",
++      "integrity": "sha512-+J9RrgTKOmlxFSDHo0pI1xM6BLVUv+o0ZT9ANtCxGkjIVCCUdx9alUF8Gm+dGLKbkkkidWIHFDZHDMpfITt4+w==",
++      "license": "MIT",
++      "engines": {
++        "node": "*"
++      }
++    },
+     "node_modules/zod": {
+       "version": "3.25.76",
+       "resolved": "https://registry.npmjs.org/zod/-/zod-3.25.76.tgz",
+diff --git a/package.json b/package.json
+index ad5b7da..82cbc6b 100644
+--- a/package.json
++++ b/package.json
+@@ -4,21 +4,29 @@
+   "version": "0.0.0",
+   "type": "module",
+   "scripts": {
+-    "client:dev": "vite",
++    "client:dev": "sh -c 'for p in 5173 5174 5175 5176 5177 5178 5179; do PIDS=$(lsof -ti :$p); if [ -n \"$PIDS\" ]; then kill -9 $PIDS; fi; done; vite'",
+     "build": "tsc -b && vite build",
+     "lint": "eslint .",
+     "preview": "vite preview",
+     "check": "tsc --noEmit",
+-    "server:dev": "nodemon",
++    "server:dev": "sh -c 'PIDS=$(lsof -ti :3001); if [ -n \"$PIDS\" ]; then kill -9 $PIDS; fi; nodemon'",
+     "dev": "concurrently \"npm run client:dev\" \"npm run server:dev\"",
+-    "seed": "tsx scripts/seed.ts"
++    "seed": "tsx scripts/seed.ts",
++    "ingest:file": "tsx scripts/ingest-file.ts",
++    "ingest:manifest": "tsx scripts/ingest-manifest.ts",
++    "ck12:convert": "tsx scripts/ck12-to-md.ts",
++    "khan:convert": "tsx scripts/khan-to-md.ts",
++    "chroma:inspect": "tsx scripts/chroma-inspect.ts",
++    "chroma:reset": "tsx scripts/chroma-reset.ts"
+   },
+   "dependencies": {
+     "@huggingface/inference": "^2.8.1",
+     "@langchain/community": "^0.0.53",
+     "@langchain/openai": "^0.0.28",
+     "@supabase/supabase-js": "^2.43.4",
++    "@xenova/transformers": "^2.17.2",
+     "axios": "^1.6.8",
++    "cheerio": "^1.2.0",
+     "chromadb": "^1.8.1",
+     "clsx": "^2.1.1",
+     "cors": "^2.8.5",
+@@ -34,6 +42,7 @@
+     "react-dom": "^18.3.1",
+     "react-router-dom": "^7.3.0",
+     "tailwind-merge": "^3.0.2",
++    "tesseract.js": "^7.0.0",
+     "uuid": "^9.0.1",
+     "zustand": "^5.0.3"
+   },
+@@ -57,6 +66,7 @@
+     "eslint-plugin-react-hooks": "^5.2.0",
+     "eslint-plugin-react-refresh": "^0.4.19",
+     "globals": "^16.0.0",
++    "kill-port": "^2.0.1",
+     "nodemon": "^3.1.10",
+     "postcss": "^8.5.3",
+     "tailwindcss": "^3.4.17",
+diff --git a/src/App.tsx b/src/App.tsx
+index e1859f1..bc5a99d 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -1,11 +1,13 @@
+ import React, { useState } from 'react';
+ import Sidebar from './components/Sidebar/Sidebar';
+ import ChatBox from './components/Chat/ChatBox';
++import EvalDashboard from './components/Eval/EvalDashboard';
+ import { Sun, Moon, Menu, X } from 'lucide-react';
+ 
+ const App: React.FC = () => {
+   const [isDarkMode, setIsDarkMode] = useState(false);
+   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
++  const [activeView, setActiveView] = useState<'chat' | 'dashboard'>('chat');
+ 
+   const toggleDarkMode = () => {
+     setIsDarkMode(!isDarkMode);
+@@ -26,7 +28,7 @@ const App: React.FC = () => {
+ 
+       {/* Sidebar */}
+       <div className={`${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'} fixed inset-y-0 left-0 z-40 lg:relative lg:translate-x-0 transition-transform duration-300 ease-in-out`}>
+-        <Sidebar />
++        <Sidebar activeView={activeView} onChangeView={setActiveView} />
+         <button
+           onClick={() => setIsSidebarOpen(false)}
+           className="absolute top-4 right-4 lg:hidden p-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+@@ -39,7 +41,7 @@ const App: React.FC = () => {
+       <main className="flex-1 flex flex-col min-w-0 relative">
+         <header className="h-16 border-b dark:border-slate-800 flex items-center justify-between px-6 bg-white/80 dark:bg-slate-950/80 backdrop-blur-sm z-30">
+           <h1 className="text-xl font-bold bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent">
+-            ML/DL Agentic Chatbot
++            Mathematics Agentic Chatbot
+           </h1>
+           
+           <button
+@@ -51,7 +53,7 @@ const App: React.FC = () => {
+         </header>
+ 
+         <div className="flex-1 overflow-hidden relative">
+-          <ChatBox />
++          {activeView === 'chat' ? <ChatBox /> : <EvalDashboard />}
+         </div>
+       </main>
+     </div>
+diff --git a/src/components/Chat/ChatBox.tsx b/src/components/Chat/ChatBox.tsx
+index 496f33e..c335793 100644
+--- a/src/components/Chat/ChatBox.tsx
++++ b/src/components/Chat/ChatBox.tsx
+@@ -1,7 +1,7 @@
+ import React, { useState, useEffect, useRef } from 'react';
+ import { useChatStore } from '../../store/useChatStore';
+ import MessageBubble from './MessageBubble';
+-import { Send, Loader2 } from 'lucide-react';
++import { Send, Loader2, Bot } from 'lucide-react';
+ import { clsx, type ClassValue } from 'clsx';
+ import { twMerge } from 'tailwind-merge';
+ 
+@@ -13,6 +13,7 @@ const ChatBox: React.FC = () => {
+   const [input, setInput] = useState('');
+   const { currentConversationId, conversations, isLoading, setLoading, createNewConversation, addMessage, updateAssistantMessage } = useChatStore();
+   const scrollRef = useRef<HTMLDivElement>(null);
++  const debugChatEnabled = import.meta.env.VITE_ENABLE_DEBUG_CHAT !== 'false';
+ 
+   const currentConversation = conversations.find(c => c.id === currentConversationId);
+ 
+@@ -38,43 +39,60 @@ const ChatBox: React.FC = () => {
+     setLoading(true);
+ 
+     try {
+-      const response = await fetch('/api/chat', {
+-        method: 'POST',
+-        headers: { 'Content-Type': 'application/json' },
+-        body: JSON.stringify({ message: userMessage, conversation_id: conversationId }),
+-      });
+-
+-      if (!response.ok) throw new Error('Failed to send message');
+-
+-      const reader = response.body?.getReader();
+-      const decoder = new TextDecoder();
+-      
+-      const assistantMessageId = Math.random().toString(36).substring(7);
+-      addMessage(conversationId, { role: 'assistant', content: '' });
+-
+-      if (reader) {
+-        while (true) {
+-          const { done, value } = await reader.read();
+-          if (done) break;
+-
+-          const chunk = decoder.decode(value);
+-          const lines = chunk.split('\n');
+-
+-          for (const line of lines) {
+-            if (line.startsWith('data: ')) {
+-              try {
+-                const data = JSON.parse(line.substring(6));
+-                if (data.type === 'chunk') {
+-                  // Find the last assistant message and update it
+-                  // We'll update the store with the chunk
+-                  const conversation = useChatStore.getState().conversations.find(c => c.id === conversationId);
+-                  const lastMsg = conversation?.messages[conversation.messages.length - 1];
+-                  if (lastMsg && lastMsg.role === 'assistant') {
+-                    updateAssistantMessage(conversationId, lastMsg.id, data.content);
++      if (debugChatEnabled) {
++        const response = await fetch('/api/debug/chat', {
++          method: 'POST',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({ message: userMessage, stream: false, conversation_id: conversationId }),
++        });
++
++        if (!response.ok) throw new Error('Failed to send message');
++        const data = await response.json();
++
++        addMessage(conversationId, {
++          role: 'assistant',
++          content: data?.answer || data?.content || 'No answer returned.',
++          debug: {
++            agent_outputs: data?.agent_outputs || {},
++            retrieval_debug: data?.retrieval_debug || {},
++            strict_validation: data?.strict_validation || {},
++          },
++        });
++      } else {
++        const response = await fetch('/api/chat', {
++          method: 'POST',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({ message: userMessage, conversation_id: conversationId }),
++        });
++
++        if (!response.ok) throw new Error('Failed to send message');
++
++        const reader = response.body?.getReader();
++        const decoder = new TextDecoder();
++        addMessage(conversationId, { role: 'assistant', content: '' });
++
++        if (reader) {
++          while (true) {
++            const { done, value } = await reader.read();
++            if (done) break;
++
++            const chunk = decoder.decode(value);
++            const lines = chunk.split('\n');
++
++            for (const line of lines) {
++              if (line.startsWith('data: ')) {
++                try {
++                  const data = JSON.parse(line.substring(6));
++                  if (data.type === 'chunk') {
++                    const conversation = useChatStore.getState().conversations.find(c => c.id === conversationId);
++                    const lastMsg = conversation?.messages[conversation.messages.length - 1];
++                    if (lastMsg && lastMsg.role === 'assistant') {
++                      updateAssistantMessage(conversationId, lastMsg.id, data.content);
++                    }
+                   }
++                } catch {
++                  // Ignore parsing errors for non-JSON lines
+                 }
+-              } catch (e) {
+-                // Ignore parsing errors for non-JSON lines
+               }
+             }
+           }
+@@ -119,7 +137,7 @@ const ChatBox: React.FC = () => {
+             type="text"
+             value={input}
+             onChange={(e) => setInput(e.target.value)}
+-            placeholder="Ask me anything about ML/DL..."
++            placeholder="Ask me anything about mathematics..."
+             className="flex-1 rounded-full border dark:border-slate-700 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-primary dark:bg-slate-800 dark:text-white"
+             disabled={isLoading}
+           />
+diff --git a/src/components/Chat/MessageBubble.tsx b/src/components/Chat/MessageBubble.tsx
+index 39414a5..ae03a01 100644
+--- a/src/components/Chat/MessageBubble.tsx
++++ b/src/components/Chat/MessageBubble.tsx
+@@ -14,6 +14,9 @@ interface MessageBubbleProps {
+ 
+ const MessageBubble: React.FC<MessageBubbleProps> = ({ message }) => {
+   const isUser = message.role === 'user';
++  const [showDebug, setShowDebug] = React.useState(false);
++
++  const hasDebug = !isUser && (message.debug?.agent_outputs || message.debug?.retrieval_debug || message.debug?.strict_validation);
+ 
+   return (
+     <div
+@@ -46,8 +49,51 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message }) => {
+         >
+           {message.content}
+         </div>
++
++        {hasDebug && (
++          <div className="w-full">
++            <button
++              type="button"
++              onClick={() => setShowDebug((v) => !v)}
++              className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline"
++            >
++              {showDebug ? 'Hide debug details' : 'Show debug details'}
++            </button>
++
++            {showDebug && (
++              <div className="mt-2 rounded-md border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-3 text-[11px] space-y-3">
++                {message.debug?.strict_validation && (
++                  <div>
++                    <div className="font-semibold">Strict validation</div>
++                    <pre className="whitespace-pre-wrap">{JSON.stringify(message.debug.strict_validation, null, 2)}</pre>
++                  </div>
++                )}
++
++                {message.debug?.retrieval_debug && (
++                  <div>
++                    <div className="font-semibold">Retrieval / reranker</div>
++                    <pre className="whitespace-pre-wrap">{JSON.stringify(message.debug.retrieval_debug, null, 2)}</pre>
++                  </div>
++                )}
++
++                {message.debug?.agent_outputs && (
++                  <div>
++                    <div className="font-semibold">Agent outputs</div>
++                    {Object.entries(message.debug.agent_outputs).map(([agent, output]) => (
++                      <details key={agent} className="mt-1">
++                        <summary className="cursor-pointer font-medium">{agent}</summary>
++                        <div className="mt-1 whitespace-pre-wrap">{String(output)}</div>
++                      </details>
++                    ))}
++                  </div>
++                )}
++              </div>
++            )}
++          </div>
++        )}
++
+         <span className="text-[10px] text-muted-foreground">
+-          {message.timestamp.toLocaleTimeString([], { hour: '2-numeric', minute: '2-numeric' })}
++          {new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+         </span>
+       </div>
+     </div>
+diff --git a/src/components/Sidebar/FileUpload.tsx b/src/components/Sidebar/FileUpload.tsx
+index 15d8cc8..69f0956 100644
+--- a/src/components/Sidebar/FileUpload.tsx
++++ b/src/components/Sidebar/FileUpload.tsx
+@@ -67,7 +67,7 @@ const FileUpload: React.FC<FileUploadProps> = ({ onClose }) => {
+ 
+         <h3 className="text-xl font-semibold mb-4 text-slate-900 dark:text-slate-100">Upload Document</h3>
+         <p className="text-sm text-slate-500 dark:text-slate-400 mb-6">
+-          Upload PDF, TXT, or MD files to expand the chatbot's knowledge base.
++          Upload PDF, TXT, MD, or PNG files to expand the chatbot's knowledge base.
+         </p>
+ 
+         <div 
+@@ -81,7 +81,7 @@ const FileUpload: React.FC<FileUploadProps> = ({ onClose }) => {
+             id="fileInput"
+             type="file"
+             className="hidden"
+-            accept=".pdf,.txt,.md"
++            accept=".pdf,.txt,.md,.png"
+             onChange={handleFileChange}
+           />
+           <div className="flex flex-col items-center gap-2">
+@@ -89,7 +89,7 @@ const FileUpload: React.FC<FileUploadProps> = ({ onClose }) => {
+             <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
+               {file ? file.name : "Click to select or drag and drop"}
+             </span>
+-            <span className="text-xs text-slate-400">PDF, TXT, MD (max 10MB)</span>
++            <span className="text-xs text-slate-400">PDF, TXT, MD, PNG (max 100MB)</span>
+           </div>
+         </div>
+ 
+diff --git a/src/components/Sidebar/Sidebar.tsx b/src/components/Sidebar/Sidebar.tsx
+index 61225b7..1d9940d 100644
+--- a/src/components/Sidebar/Sidebar.tsx
++++ b/src/components/Sidebar/Sidebar.tsx
+@@ -1,6 +1,6 @@
+ import React, { useState } from 'react';
+ import { useChatStore } from '../../store/useChatStore';
+-import { MessageSquare, Plus, Trash2, Edit3, Settings, LogOut, FileUp } from 'lucide-react';
++import { MessageSquare, Plus, Trash2, Edit3, Settings, LogOut, FileUp, BarChart3 } from 'lucide-react';
+ import FileUpload from './FileUpload';
+ import { clsx, type ClassValue } from 'clsx';
+ import { twMerge } from 'tailwind-merge';
+@@ -9,7 +9,12 @@ function cn(...inputs: ClassValue[]) {
+   return twMerge(clsx(inputs));
+ }
+ 
+-const Sidebar: React.FC = () => {
++interface SidebarProps {
++  activeView: 'chat' | 'dashboard';
++  onChangeView: (view: 'chat' | 'dashboard') => void;
++}
++
++const Sidebar: React.FC<SidebarProps> = ({ activeView, onChangeView }) => {
+   const { conversations, currentConversationId, setCurrentConversation, createNewConversation } = useChatStore();
+   const [isUploading, setIsUploading] = useState(false);
+ 
+@@ -48,7 +53,33 @@ const Sidebar: React.FC = () => {
+       </div>
+ 
+       <div className="border-t dark:border-slate-800 pt-4 space-y-2">
+-        <button 
++        <button
++          onClick={() => onChangeView('dashboard')}
++          className={cn(
++            'flex items-center gap-2 rounded-lg p-2 text-sm transition-colors w-full',
++            activeView === 'dashboard'
++              ? 'bg-slate-200 dark:bg-slate-800 text-blue-600 dark:text-blue-400'
++              : 'text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800'
++          )}
++        >
++          <BarChart3 size={18} />
++          Evaluation Dashboard
++        </button>
++
++        <button
++          onClick={() => onChangeView('chat')}
++          className={cn(
++            'flex items-center gap-2 rounded-lg p-2 text-sm transition-colors w-full',
++            activeView === 'chat'
++              ? 'bg-slate-200 dark:bg-slate-800 text-blue-600 dark:text-blue-400'
++              : 'text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800'
++          )}
++        >
++          <MessageSquare size={18} />
++          Chat View
++        </button>
++
++        <button
+           onClick={() => setIsUploading(!isUploading)}
+           className="flex items-center gap-2 rounded-lg p-2 text-sm text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors w-full"
+         >
+@@ -56,7 +87,7 @@ const Sidebar: React.FC = () => {
+           Upload Document
+         </button>
+         {isUploading && <FileUpload onClose={() => setIsUploading(false)} />}
+-        
++
+         <button className="flex items-center gap-2 rounded-lg p-2 text-sm text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors w-full">
+           <Settings size={18} />
+           Settings
+diff --git a/src/index.css b/src/index.css
+index 4f25c7d..1312a44 100644
+--- a/src/index.css
++++ b/src/index.css
+@@ -7,68 +7,22 @@
+   line-height: 1.5;
+   font-weight: 400;
+ 
+-  color-scheme: light dark;
+-  color: rgba(255, 255, 255, 0.87);
+-  background-color: #242424;
+-
+   font-synthesis: none;
+   text-rendering: optimizeLegibility;
+   -webkit-font-smoothing: antialiased;
+   -moz-osx-font-smoothing: grayscale;
+ }
+ 
+-a {
+-  font-weight: 500;
+-  color: #646cff;
+-  text-decoration: inherit;
+-}
+-a:hover {
+-  color: #535bf2;
++html,
++body,
++#root {
++  width: 100%;
++  height: 100%;
+ }
+ 
+ body {
+   margin: 0;
+-  display: flex;
+-  place-items: center;
+   min-width: 320px;
+-  min-height: 100vh;
+-}
+-
+-h1 {
+-  font-size: 3.2em;
+-  line-height: 1.1;
+-}
+-
+-button {
+-  border-radius: 8px;
+-  border: 1px solid transparent;
+-  padding: 0.6em 1.2em;
+-  font-size: 1em;
+-  font-weight: 500;
+-  font-family: inherit;
+-  background-color: #1a1a1a;
+-  cursor: pointer;
+-  transition: border-color 0.25s;
+-}
+-button:hover {
+-  border-color: #646cff;
+-}
+-button:focus,
+-button:focus-visible {
+-  outline: 4px auto -webkit-focus-ring-color;
+-}
+-
+-@media (prefers-color-scheme: light) {
+-  :root {
+-    color: #213547;
+-    background-color: #ffffff;
+-  }
+-  a:hover {
+-    color: #747bff;
+-  }
+-  button {
+-    background-color: #f9f9f9;
+-  }
+ }
+ 
+ /* Custom Scrollbar */
+diff --git a/src/store/useChatStore.ts b/src/store/useChatStore.ts
+index e8b8f51..6a4fc3b 100644
+--- a/src/store/useChatStore.ts
++++ b/src/store/useChatStore.ts
+@@ -5,6 +5,11 @@ export interface Message {
+   role: 'user' | 'assistant';
+   content: string;
+   timestamp: Date;
++  debug?: {
++    agent_outputs?: Record<string, string>;
++    retrieval_debug?: Record<string, any>;
++    strict_validation?: Record<string, any>;
++  };
+ }
+ 
+ export interface Conversation {
+@@ -17,7 +22,7 @@ interface ChatState {
+   conversations: Conversation[];
+   currentConversationId: string | null;
+   isLoading: boolean;
+-  addMessage: (conversationId: string, message: Omit<Message, 'id' | 'timestamp'>) => void;
++  addMessage: (conversationId: string, message: Omit<Message, 'id' | 'timestamp'>) => string;
+   setLoading: (loading: boolean) => void;
+   createNewConversation: () => string;
+   setCurrentConversation: (id: string) => void;
+diff --git a/vite.config.ts b/vite.config.ts
+index 2409877..1cf52aa 100644
+--- a/vite.config.ts
++++ b/vite.config.ts
+@@ -1,46 +1,51 @@
+-import { defineConfig } from 'vite'
++import { defineConfig, loadEnv } from 'vite'
+ import react from '@vitejs/plugin-react'
+ import tsconfigPaths from "vite-tsconfig-paths";
+ import { traeBadgePlugin } from 'vite-plugin-trae-solo-badge';
+ 
+ // https://vite.dev/config/
+-export default defineConfig({
+-  plugins: [
+-    react({
+-      babel: {
+-        plugins: [
+-          'react-dev-locator',
+-        ],
+-      },
+-    }),
+-    traeBadgePlugin({
+-      variant: 'dark',
+-      position: 'bottom-right',
+-      prodOnly: true,
+-      clickable: true,
+-      clickUrl: 'https://www.trae.ai/solo?showJoin=1',
+-      autoTheme: true,
+-      autoThemeTarget: '#root'
+-    }), 
+-    tsconfigPaths(),
+-  ],
+-  server: {
+-    proxy: {
+-      '/api': {
+-        target: 'http://localhost:3001',
+-        changeOrigin: true,
+-        secure: false,
+-        configure: (proxy, _options) => {
+-          proxy.on('error', (err, _req, _res) => {
+-            console.log('proxy error', err);
+-          });
+-          proxy.on('proxyReq', (proxyReq, req, _res) => {
+-            console.log('Sending Request to the Target:', req.method, req.url);
+-          });
+-          proxy.on('proxyRes', (proxyRes, req, _res) => {
+-            console.log('Received Response from the Target:', proxyRes.statusCode, req.url);
+-          });
++export default defineConfig(({ mode }) => {
++  const env = loadEnv(mode, process.cwd(), '');
++  const apiTarget = env.VITE_API_URL || 'http://localhost:8002';
++
++  return {
++    plugins: [
++      react({
++        babel: {
++          plugins: [
++            'react-dev-locator',
++          ],
+         },
++      }),
++      traeBadgePlugin({
++        variant: 'dark',
++        position: 'bottom-right',
++        prodOnly: true,
++        clickable: true,
++        clickUrl: 'https://www.trae.ai/solo?showJoin=1',
++        autoTheme: true,
++        autoThemeTarget: '#root'
++      }),
++      tsconfigPaths(),
++    ],
++    server: {
++      proxy: {
++        '/api': {
++          target: apiTarget,
++          changeOrigin: true,
++          secure: false,
++          configure: (proxy, _options) => {
++            proxy.on('error', (err, _req, _res) => {
++              console.log('proxy error', err);
++            });
++            proxy.on('proxyReq', (proxyReq, req, _res) => {
++              console.log('Sending Request to the Target:', req.method, req.url);
++            });
++            proxy.on('proxyRes', (proxyRes, req, _res) => {
++              console.log('Received Response from the Target:', proxyRes.statusCode, req.url);
++            });
++          },
++        }
+       }
+     }
+   }

@@ -5,6 +5,12 @@ export interface Message {
   role: 'user' | 'assistant';
   content: string;
   timestamp: Date;
+  debug?: {
+    agent_outputs?: Record<string, string>;
+    retrieval_debug?: Record<string, any>;
+    strict_validation?: Record<string, any>;
+    upload_context?: Record<string, any> | null;
+  };
 }
 
 export interface Conversation {
@@ -17,7 +23,7 @@ interface ChatState {
   conversations: Conversation[];
   currentConversationId: string | null;
   isLoading: boolean;
-  addMessage: (conversationId: string, message: Omit<Message, 'id' | 'timestamp'>) => void;
+  addMessage: (conversationId: string, message: Omit<Message, 'id' | 'timestamp'>) => string;
   setLoading: (loading: boolean) => void;
   createNewConversation: () => string;
   setCurrentConversation: (id: string) => void;

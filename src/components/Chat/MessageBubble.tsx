@@ -14,6 +14,14 @@ interface MessageBubbleProps {
 
 const MessageBubble: React.FC<MessageBubbleProps> = ({ message }) => {
   const isUser = message.role === 'user';
+  const [showDebug, setShowDebug] = React.useState(false);
+
+  const hasDebug = !isUser && (
+    message.debug?.agent_outputs ||
+    message.debug?.retrieval_debug ||
+    message.debug?.strict_validation ||
+    message.debug?.upload_context
+  );
 
   return (
     <div
@@ -46,8 +54,58 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message }) => {
         >
           {message.content}
         </div>
+
+        {hasDebug && (
+          <div className="w-full">
+            <button
+              type="button"
+              onClick={() => setShowDebug((v) => !v)}
+              className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline"
+            >
+              {showDebug ? 'Hide debug details' : 'Show debug details'}
+            </button>
+
+            {showDebug && (
+              <div className="mt-2 rounded-md border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-3 text-[11px] space-y-3">
+                {message.debug?.upload_context && (
+                  <div>
+                    <div className="font-semibold">Current uploaded file</div>
+                    <pre className="whitespace-pre-wrap">{JSON.stringify(message.debug.upload_context, null, 2)}</pre>
+                  </div>
+                )}
+
+                {message.debug?.strict_validation && (
+                  <div>
+                    <div className="font-semibold">Strict validation</div>
+                    <pre className="whitespace-pre-wrap">{JSON.stringify(message.debug.strict_validation, null, 2)}</pre>
+                  </div>
+                )}
+
+                {message.debug?.retrieval_debug && (
+                  <div>
+                    <div className="font-semibold">Retrieval / reranker</div>
+                    <pre className="whitespace-pre-wrap">{JSON.stringify(message.debug.retrieval_debug, null, 2)}</pre>
+                  </div>
+                )}
+
+                {message.debug?.agent_outputs && (
+                  <div>
+                    <div className="font-semibold">Agent outputs</div>
+                    {Object.entries(message.debug.agent_outputs).map(([agent, output]) => (
+                      <details key={agent} className="mt-1">
+                        <summary className="cursor-pointer font-medium">{agent}</summary>
+                        <div className="mt-1 whitespace-pre-wrap">{String(output)}</div>
+                      </details>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
         <span className="text-[10px] text-muted-foreground">
-          {message.timestamp.toLocaleTimeString([], { hour: '2-numeric', minute: '2-numeric' })}
+          {new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
         </span>
       </div>
     </div>

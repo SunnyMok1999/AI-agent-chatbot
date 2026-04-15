@@ -1,0 +1,32 @@
+ M .env.example
+ M README.md
+ M api/app.ts
+ M api/controllers/chat.controller.ts
+ M api/controllers/upload.controller.ts
+ M api/routes/upload.ts
+ M api/server.ts
+ M api/services/llm.service.ts
+ M api/services/rag.service.ts
+ M api/services/vectorstore.service.ts
+ M nodemon.json
+ M package-lock.json
+ M package.json
+ M src/App.tsx
+ M src/components/Chat/ChatBox.tsx
+ M src/components/Chat/MessageBubble.tsx
+ M src/components/Sidebar/FileUpload.tsx
+ M src/components/Sidebar/Sidebar.tsx
+ M src/index.css
+ M src/store/useChatStore.ts
+ M vite.config.ts
+?? api/services/upload-context.service.ts
+?? backups/
+?? eng.traineddata
+?? python_backend/
+?? scripts/chroma-inspect.ts
+?? scripts/chroma-reset.ts
+?? scripts/ck12-to-md.ts
+?? scripts/ingest-file.ts
+?? scripts/ingest-manifest.ts
+?? scripts/khan-to-md.ts
+?? src/components/Eval/

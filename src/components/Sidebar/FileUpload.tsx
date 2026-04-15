@@ -15,13 +15,59 @@ const FileUpload: React.FC<FileUploadProps> = ({ onClose }) => {
   const [file, setFile] = useState<File | null>(null);
   const [status, setStatus] = useState<'idle' | 'uploading' | 'success' | 'error'>('idle');
   const [message, setMessage] = useState('');
+  const [isDragging, setIsDragging] = useState(false);
+
+  const isSupportedFile = (candidate: File) => {
+    const allowedMime = new Set([
+      'application/pdf',
+      'text/plain',
+      'text/markdown',
+      'image/png',
+      'image/x-png',
+    ]);
+
+    if (allowedMime.has(candidate.type)) return true;
+    const name = candidate.name.toLowerCase();
+    return name.endsWith('.pdf') || name.endsWith('.txt') || name.endsWith('.md') || name.endsWith('.png');
+  };
+
+  const selectFile = (candidate: File) => {
+    if (!isSupportedFile(candidate)) {
+      setStatus('error');
+      setMessage('Unsupported file format. Please upload PDF, TXT, MD, or PNG.');
+      return;
+    }
+
+    setFile(candidate);
+    setStatus('idle');
+    setMessage('');
+  };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
-      setFile(e.target.files[0]);
-      setStatus('idle');
-      setMessage('');
+      selectFile(e.target.files[0]);
     }
+  };
+
+  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!isDragging) setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+
+    const dropped = e.dataTransfer?.files?.[0];
+    if (dropped) selectFile(dropped);
   };
 
   const handleUpload = async () => {
@@ -67,21 +113,29 @@ const FileUpload: React.FC<FileUploadProps> = ({ onClose }) => {
 
         <h3 className="text-xl font-semibold mb-4 text-slate-900 dark:text-slate-100">Upload Document</h3>
         <p className="text-sm text-slate-500 dark:text-slate-400 mb-6">
-          Upload PDF, TXT, or MD files to expand the chatbot's knowledge base.
+          Upload PDF, TXT, MD, or PNG files to expand the chatbot's knowledge base.
         </p>
 
         <div 
           className={cn(
             "border-2 border-dashed rounded-xl p-8 transition-colors text-center cursor-pointer mb-6",
-            file ? "border-blue-500 bg-blue-50 dark:bg-blue-900/20" : "border-slate-300 dark:border-slate-700 hover:border-blue-400 dark:hover:border-blue-600"
+            isDragging
+              ? "border-blue-500 bg-blue-50 dark:bg-blue-900/30"
+              : file
+                ? "border-blue-500 bg-blue-50 dark:bg-blue-900/20"
+                : "border-slate-300 dark:border-slate-700 hover:border-blue-400 dark:hover:border-blue-600"
           )}
           onClick={() => document.getElementById('fileInput')?.click()}
+          onDragOver={handleDragOver}
+          onDragEnter={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
         >
           <input
             id="fileInput"
             type="file"
             className="hidden"
-            accept=".pdf,.txt,.md"
+            accept=".pdf,.txt,.md,.png"
             onChange={handleFileChange}
           />
           <div className="flex flex-col items-center gap-2">
@@ -89,7 +143,7 @@ const FileUpload: React.FC<FileUploadProps> = ({ onClose }) => {
             <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
               {file ? file.name : "Click to select or drag and drop"}
             </span>
-            <span className="text-xs text-slate-400">PDF, TXT, MD (max 10MB)</span>
+            <span className="text-xs text-slate-400">PDF, TXT, MD, PNG (max 100MB)</span>
           </div>
         </div>
 

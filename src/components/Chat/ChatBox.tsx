@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useChatStore } from '../../store/useChatStore';
 import MessageBubble from './MessageBubble';
-import { Send, Loader2 } from 'lucide-react';
+import { Send, Loader2, Bot } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -13,6 +13,7 @@ const ChatBox: React.FC = () => {
   const [input, setInput] = useState('');
   const { currentConversationId, conversations, isLoading, setLoading, createNewConversation, addMessage, updateAssistantMessage } = useChatStore();
   const scrollRef = useRef<HTMLDivElement>(null);
+  const debugChatEnabled = import.meta.env.VITE_ENABLE_DEBUG_CHAT !== 'false';
 
   const currentConversation = conversations.find(c => c.id === currentConversationId);
 
@@ -38,43 +39,61 @@ const ChatBox: React.FC = () => {
     setLoading(true);
 
     try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: userMessage, conversation_id: conversationId }),
-      });
+      if (debugChatEnabled) {
+        const response = await fetch('/api/debug/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: userMessage, stream: false, conversation_id: conversationId }),
+        });
 
-      if (!response.ok) throw new Error('Failed to send message');
+        if (!response.ok) throw new Error('Failed to send message');
+        const data = await response.json();
 
-      const reader = response.body?.getReader();
-      const decoder = new TextDecoder();
-      
-      const assistantMessageId = Math.random().toString(36).substring(7);
-      addMessage(conversationId, { role: 'assistant', content: '' });
+        addMessage(conversationId, {
+          role: 'assistant',
+          content: data?.answer || data?.content || 'No answer returned.',
+          debug: {
+            agent_outputs: data?.agent_outputs || {},
+            retrieval_debug: data?.retrieval_debug || {},
+            strict_validation: data?.strict_validation || {},
+            upload_context: data?.upload_context || null,
+          },
+        });
+      } else {
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: userMessage, conversation_id: conversationId }),
+        });
 
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+        if (!response.ok) throw new Error('Failed to send message');
 
-          const chunk = decoder.decode(value);
-          const lines = chunk.split('\n');
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+        addMessage(conversationId, { role: 'assistant', content: '' });
 
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try {
-                const data = JSON.parse(line.substring(6));
-                if (data.type === 'chunk') {
-                  // Find the last assistant message and update it
-                  // We'll update the store with the chunk
-                  const conversation = useChatStore.getState().conversations.find(c => c.id === conversationId);
-                  const lastMsg = conversation?.messages[conversation.messages.length - 1];
-                  if (lastMsg && lastMsg.role === 'assistant') {
-                    updateAssistantMessage(conversationId, lastMsg.id, data.content);
+        if (reader) {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            const chunk = decoder.decode(value);
+            const lines = chunk.split('\n');
+
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                try {
+                  const data = JSON.parse(line.substring(6));
+                  if (data.type === 'chunk') {
+                    const conversation = useChatStore.getState().conversations.find(c => c.id === conversationId);
+                    const lastMsg = conversation?.messages[conversation.messages.length - 1];
+                    if (lastMsg && lastMsg.role === 'assistant') {
+                      updateAssistantMessage(conversationId, lastMsg.id, data.content);
+                    }
                   }
+                } catch {
+                  // Ignore parsing errors for non-JSON lines
                 }
-              } catch (e) {
-                // Ignore parsing errors for non-JSON lines
               }
             }
           }
@@ -119,7 +138,7 @@ const ChatBox: React.FC = () => {
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask me anything about ML/DL..."
+            placeholder="Ask me anything about mathematics..."
             className="flex-1 rounded-full border dark:border-slate-700 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-primary dark:bg-slate-800 dark:text-white"
             disabled={isLoading}
           />
