@@ -1,5 +1,16 @@
 # DSEMATH AI Agent Chatbot
 
+## Team Members
+
+- 22112435d — Mok Pan Yu
+- 23099792d — Ekaterina SMUGLINA
+- 23086991d — Chen Chun Yung
+
+## Current Project Status
+
+- ✅ **Streamlit stack (`app.py`) is currently usable** for the project timeline.
+- 🚧 **Node multi-agent version is not completed in this timeline** and is still undergoing development.
+
 Multimodal HKDSE Math assistant with two runnable paths in one repository:
 
 1. **Web app stack (React + Node/Express)** for full chat product flows.
