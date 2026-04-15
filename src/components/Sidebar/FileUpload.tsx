@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Upload, X, Loader2, CheckCircle2, AlertCircle } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { useChatStore } from '../../store/useChatStore';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -12,6 +13,7 @@ interface FileUploadProps {
 }
 
 const FileUpload: React.FC<FileUploadProps> = ({ onClose }) => {
+  const { currentConversationId, createNewConversation } = useChatStore();
   const [file, setFile] = useState<File | null>(null);
   const [status, setStatus] = useState<'idle' | 'uploading' | 'success' | 'error'>('idle');
   const [message, setMessage] = useState('');
@@ -78,6 +80,8 @@ const FileUpload: React.FC<FileUploadProps> = ({ onClose }) => {
 
     const formData = new FormData();
     formData.append('file', file);
+    const sessionId = currentConversationId || createNewConversation();
+    formData.append('session_id', sessionId);
 
     try {
       const response = await fetch('/api/upload', {

@@ -5,6 +5,7 @@ from typing import Optional, List
 class ChatRequest(BaseModel):
     message: str
     stream: bool = False
+    conversation_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
