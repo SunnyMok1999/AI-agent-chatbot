@@ -633,6 +633,10 @@ def _tool_request_peer_review(
     return peer_res.content if isinstance(peer_res.content, str) else str(peer_res.content)
 
 
+def _with_attribution(state: GraphState, attribution: Dict[str, Any]) -> Dict[str, Any]:
+    return {**(state.get("retrieval_debug") or {}), "attribution": attribution}
+
+
 def _execute_tool_call(
     payload: Dict[str, Any],
     *,
@@ -892,7 +896,7 @@ def node_generate(state: GraphState) -> GraphState:
             "question_pages": uploaded_question_pages,
             "scan_issues": upload_scan_issues,
         }
-        return {"answer": answer, "agent_outputs": agent_outputs, "retrieval_debug": {**(state.get("retrieval_debug") or {}), "attribution": attribution}}
+        return {"answer": answer, "agent_outputs": agent_outputs, "retrieval_debug": _with_attribution(state, attribution)}
 
     if context:
         prompt = (
@@ -917,7 +921,7 @@ def node_generate(state: GraphState) -> GraphState:
         "question_pages": uploaded_question_pages,
         "scan_issues": upload_scan_issues,
     }
-    return {"answer": answer, "retrieval_debug": {**(state.get("retrieval_debug") or {}), "attribution": attribution}}
+    return {"answer": answer, "retrieval_debug": _with_attribution(state, attribution)}
 
 
 def node_validate(state: GraphState) -> GraphState:

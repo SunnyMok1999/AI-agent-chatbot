@@ -388,6 +388,12 @@ def uploaded_questions(session_id: str = Query(default="default")):
     latest_text = get_latest_text(session_id=resolved)
     if not latest_text:
         return {"success": False, "error": "No uploaded document found for session", "session_id": resolved}
+    def _question_number_sort_key(item: tuple[str, str]) -> int:
+        try:
+            return int(item[0])
+        except (TypeError, ValueError):
+            return 9999
+
     return {
         "success": True,
         "session_id": resolved,
@@ -399,7 +405,7 @@ def uploaded_questions(session_id: str = Query(default="default")):
                 "content": content,
                 "pages": (latest_text.question_pages or {}).get(q_no, []),
             }
-            for q_no, content in sorted((latest_text.question_blocks or {}).items(), key=lambda x: int(x[0]))
+            for q_no, content in sorted((latest_text.question_blocks or {}).items(), key=_question_number_sort_key)
             if q_no in {"1", "2", "3"}
         ],
     }

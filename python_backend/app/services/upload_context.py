@@ -2,6 +2,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Optional
 import json
+import logging
 import time
 
 
@@ -57,7 +58,8 @@ def _load() -> None:
         raw_image = payload.get("image_by_session", {}) or {}
         _text_by_session = {k: UploadTextContext(**v) for k, v in raw_text.items()}
         _image_by_session = {k: UploadImageContext(**v) for k, v in raw_image.items()}
-    except Exception:
+    except (json.JSONDecodeError, OSError, TypeError, ValueError) as error:
+        logging.warning("Failed to load persisted upload context: %s", error)
         _latest_session_id = None
         _text_by_session = {}
         _image_by_session = {}

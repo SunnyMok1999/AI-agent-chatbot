@@ -24,6 +24,7 @@ def normalize_math_ocr_text(text: str) -> str:
         "α": "alpha",
         "β": "beta",
         "γ": "gamma",
+        "λ": "lambda",
         "Δ": "Delta",
         "∞": "infinity",
         "√": "sqrt",
@@ -76,6 +77,7 @@ def segment_hkdse_questions(
     question_numbers: Iterable[int] = (1, 2, 3),
 ) -> Dict[int, QuestionBlock]:
     text = normalize_math_ocr_text(full_text)
+    normalized_pages = [normalize_math_ocr_text(p).lower() for p in page_texts]
     anchors = _find_question_anchors(text)
     targets = set(question_numbers)
     out: Dict[int, QuestionBlock] = {}
@@ -93,8 +95,8 @@ def segment_hkdse_questions(
 
         body_pages: List[int] = []
         snippet = body[:120].lower()
-        for p_i, page_text in enumerate(page_texts):
-            if snippet and snippet in normalize_math_ocr_text(page_text).lower():
+        for p_i, page_text in enumerate(normalized_pages):
+            if snippet and snippet in page_text:
                 body_pages.append(p_i + 1)
         if not body_pages:
             body_pages = [1]
@@ -130,7 +132,7 @@ def detect_scan_issues(page_texts: Sequence[str]) -> List[str]:
         issues.append("low_readable_text_density")
     if "�" in merged or "\x00" in merged:
         issues.append("broken_symbol_encoding")
-    if re.search(r"[∫∑πθαλβγ]", merged) and not re.search(r"(integral|sum|pi|theta|alpha|beta|gamma)", merged.lower()):
+    if re.search(r"[∫∑πθαλβγ]", merged) and not re.search(r"(integral|sum|pi|theta|alpha|beta|gamma|lambda)", merged.lower()):
         issues.append("complex_notation_unstable_ocr")
     if re.search(r"\bhandwritten\b", merged.lower()):
         issues.append("possible_handwritten_annotation")
