@@ -51,22 +51,59 @@ AGENT_REGISTRY: dict[str, AgentConfig] = {
 
 class SentenceTransformerEmbedding:
     def __init__(self, model_name: str) -> None:
+        self._name = model_name
         self.model = SentenceTransformer(model_name)
+
+    def name(self) -> str:
+        return self._name
 
     def __call__(self, input: list[str]) -> list[list[float]]:
         vectors = self.model.encode(input, normalize_embeddings=True)
         return [vector.tolist() for vector in vectors]
 
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self(texts)
+
+    def embed_query(self, input: str | list[str]) -> list[list[float]]:
+        if isinstance(input, list):
+            query = input[0] if input else ""
+        else:
+            query = input
+        return self([query])
+
+
+def _embedding_candidates() -> list[str]:
+    candidates = [EMBEDDING_MODEL, "BAAI/bge-small-en-v1.5", "sentence-transformers/all-MiniLM-L6-v2"]
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for name in candidates:
+        key = (name or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(key)
+    return deduped
+
 
 @st.cache_resource(show_spinner=False)
 def get_collection() -> Any:
     client = chromadb.PersistentClient(path=CHROMA_PATH)
-    embedding = SentenceTransformerEmbedding(EMBEDDING_MODEL)
-    return client.get_or_create_collection(
-        name=CHROMA_COLLECTION,
-        embedding_function=embedding,
-        metadata={"hnsw:space": "cosine"},
-    )
+    last_error: Exception | None = None
+    for model_name in _embedding_candidates():
+        try:
+            embedding = SentenceTransformerEmbedding(model_name)
+            return client.get_or_create_collection(
+                name=CHROMA_COLLECTION,
+                embedding_function=embedding,
+                metadata={"hnsw:space": "cosine"},
+            )
+        except Exception as exc:
+            last_error = exc
+            st.warning(f"Embedding model failed: {model_name}. Falling back to another model.")
+
+    if last_error:
+        raise RuntimeError(f"Failed to initialize any embedding model: {last_error}")
+    raise RuntimeError("Failed to initialize embedding model")
 
 
 def to_data_url(mime_type: str, data: bytes) -> str:
@@ -108,18 +145,24 @@ def run_rag_retrieve(query: str) -> str:
         return json.dumps({"error": str(exc)})
 
 
-def call_nvidia_chat(messages: list[dict[str, Any]], tools: list[dict[str, Any]], model: str) -> dict[str, Any]:
+def call_nvidia_chat(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    model: str,
+    enable_tools: bool = True,
+) -> dict[str, Any]:
     if not NVIDIA_API_KEY:
         raise RuntimeError("Environment variable NVIDIA_API_KEY is not configured. Please set it in .env or your runtime environment.")
 
     endpoint = f"{NVIDIA_BASE_URL.rstrip('/')}/chat/completions"
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "tools": tools,
-        "tool_choice": "auto",
         "temperature": 0.2,
     }
+    if enable_tools and tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
 
     with httpx.Client(timeout=60) as client:
         res = client.post(
@@ -130,7 +173,13 @@ def call_nvidia_chat(messages: list[dict[str, Any]], tools: list[dict[str, Any]]
             },
             json=payload,
         )
-        res.raise_for_status()
+        try:
+            res.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            details = res.text[:1200] if res is not None else ""
+            raise RuntimeError(
+                f"NVIDIA API request failed ({res.status_code}). Response: {details}"
+            ) from exc
         return res.json()
 
 
@@ -174,6 +223,7 @@ def execute_tool(tool_name: str, arguments: dict[str, Any]) -> str:
 def run_agent(agent: AgentConfig, user_text: str, session_upload_images: list[str], chat_history: list[dict[str, str]]) -> str:
     tools = build_tools()
     model = NVIDIA_VLM_MODEL if session_upload_images else NVIDIA_TEXT_MODEL
+    enable_tools = not bool(session_upload_images)
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": agent.system_prompt}]
     for msg in chat_history:
@@ -184,8 +234,19 @@ def run_agent(agent: AgentConfig, user_text: str, session_upload_images: list[st
         user_content.append({"type": "image_url", "image_url": {"url": image_data_url}})
     messages.append({"role": "user", "content": user_content})
 
+    if not enable_tools:
+        response = call_nvidia_chat(messages=messages, tools=tools, model=model, enable_tools=False)
+        choice = response.get("choices", [{}])[0].get("message", {})
+        content = choice.get("content", "")
+        if isinstance(content, str):
+            return content
+        st.warning(
+            f"Received non-string vision response payload (type={type(content).__name__}); returning serialized content."
+        )
+        return json.dumps(content)
+
     for _ in range(MAX_TOOL_ITERATIONS):
-        response = call_nvidia_chat(messages=messages, tools=tools, model=model)
+        response = call_nvidia_chat(messages=messages, tools=tools, model=model, enable_tools=True)
         choice = response.get("choices", [{}])[0].get("message", {})
         tool_calls = choice.get("tool_calls") or []
 
